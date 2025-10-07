@@ -14,13 +14,10 @@ This addon provides ESP RainMaker integration for Home Assistant, allowing you t
 
 ## Features
 
-- Automatic discovery of ESP RainMaker devices
-- Control lights and switches with full brightness and color support
+- Listing of ESP RainMaker devices
+- Control lights with brightness and color support
 - Monitor device status and parameters
-- Real-time updates from ESP RainMaker cloud
-- Responsive device control with optimized polling
-- Device name synchronization
-- Professional ESP RainMaker branding
+- Updates from ESP RainMaker cloud
 
 ## Installation
 
