@@ -45,7 +45,8 @@ This addon provides ESP RainMaker integration for Home Assistant, allowing you t
 |--------|-------------|---------|
 | `email` | Your ESP RainMaker account email | - |
 | `password` | Your ESP RainMaker account password | - |
-| `profile` | ESP RainMaker profile to use | `global` |
+| `profile` | ESP RainMaker profile to use | `my_profile` |
+| `base_url` | Base URL for custom ESP RainMaker profile. If provided, all custom profiles will be removed and a new profile will be created and used | `https://api.rainmaker.espressif.com/v1/` |
 | `api_port` | Port for the internal API | `8100` |
 
 ### Example Configuration
@@ -53,7 +54,8 @@ This addon provides ESP RainMaker integration for Home Assistant, allowing you t
 ```yaml
 email: "your.email@example.com"
 password: "your_password"
-profile: "global"
+profile: "my_profile"
+base_url: "https://api.rainmaker.espressif.com/v1/"
 api_port: 8100
 ```
 

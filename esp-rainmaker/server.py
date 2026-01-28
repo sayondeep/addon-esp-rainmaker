@@ -1,6 +1,8 @@
 from flask import Flask, jsonify, request
 import subprocess, os
 import time
+import hashlib
+import re
 
 app = Flask(__name__)
 
@@ -11,26 +13,140 @@ def run_cli(cmd):
     )
     return result.stdout.strip() or result.stderr.strip()
 
-def ensure_login():
-    """Ensure ESP RainMaker CLI is logged in"""
-    # Check if already logged in
+def get_custom_profiles():
+    """Get list of custom profile names"""
+    output = run_cli(["profile", "list"])
+    custom_profiles = []
+
+    print(f"DEBUG: Profile list output:\n{output}")
+
+    lines = output.splitlines()
+    current_profile = None
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Profile name is on a line starting with spaces and a name (may have "(current)" suffix)
+        if re.match(r'^\s+\w+', line):
+            # Extract profile name (first word after leading spaces, before any parentheses)
+            match = re.match(r'^\s+(\w+)', line)
+            if match:
+                current_profile = match.group(1)
+                print(f"DEBUG: Found profile name: {current_profile}")
+        # Check if it's a custom profile - look for "Type: custom" in the same or following lines
+        elif current_profile:
+            if "Type: custom" in stripped:
+                custom_profiles.append(current_profile)
+                print(f"DEBUG: Added custom profile: {current_profile}")
+                current_profile = None
+            elif "Type: builtin" in stripped:
+                print(f"DEBUG: Skipping builtin profile: {current_profile}")
+                current_profile = None
+            # Also check if we've moved to the next profile (new profile name line)
+            elif re.match(r'^\s+\w+', line):
+                # This shouldn't happen as we already handled it above, but just in case
+                current_profile = None
+
+    print(f"DEBUG: Found {len(custom_profiles)} custom profiles: {custom_profiles}")
+    return custom_profiles
+
+def remove_all_custom_profiles():
+    """Remove all custom profiles"""
+    custom_profiles = get_custom_profiles()
+    for profile_name in custom_profiles:
+        print(f"Removing custom profile: {profile_name}")
+        result = subprocess.run(
+            ["esp-rainmaker-cli", "profile", "remove", profile_name],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if result.returncode == 0:
+            print(f"Successfully removed profile: {profile_name}")
+        else:
+            print(f"Failed to remove profile {profile_name}: {result.stderr}")
+
+def create_profile_from_base_url(profile_name, base_url):
+
+    print(f"Creating new profile '{profile_name}' with base URL: {base_url}")
+
+    # Create profile with the base_url using --base-url parameter
     result = subprocess.run(
-        ["esp-rainmaker-cli", "getnodes"],
+        ["esp-rainmaker-cli", "profile", "add", profile_name, "--base-url", base_url],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
 
-    # If we get nodes or a proper response, we're logged in
-    if result.returncode == 0 and not ("login" in result.stderr.lower() or "authentication" in result.stderr.lower()):
-        return True
+    if result.returncode == 0:
+        print(f"Successfully created profile: {profile_name}")
+        return profile_name
+    else:
+        print(f"Failed to create profile: {result.stderr}")
+        return None
+
+def manage_profiles_if_needed():
+    """Manage profiles if base_url is provided - runs before login check"""
+    base_url = os.environ.get("ESP_RAINMAKER_BASE_URL")
+    profile_name = os.environ.get("ESP_RAINMAKER_PROFILE")
+
+    # If base_url is provided, manage profiles
+    if base_url and base_url.strip() and base_url.lower() != "null":
+        print(f"Base URL provided: {base_url}, managing profiles...")
+
+        # Logout first to ensure fresh login with new profile
+        print("Logging out from current session...")
+        logout_result = subprocess.run(
+            ["esp-rainmaker-cli", "logout"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if logout_result.returncode == 0:
+            print("Successfully logged out")
+        else:
+            print(f"Note: Logout result (may not be logged in): {logout_result.stderr}")
+
+        # Remove all custom profiles
+        remove_all_custom_profiles()
+
+        # Create new profile with base_url
+        new_profile = create_profile_from_base_url(profile_name.strip(), base_url.strip())
+        if new_profile:
+            # Switch to the new profile so all subsequent commands use it
+            print(f"Switching to profile: {new_profile}")
+            switch_result = subprocess.run(
+                ["esp-rainmaker-cli", "profile", "switch", new_profile],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if switch_result.returncode == 0:
+                print(f"Successfully switched to profile: {new_profile}")
+            else:
+                print(f"WARNING: Failed to switch to profile {new_profile}: {switch_result.stderr}")
+
+            # Update environment variable so ensure_login() will use this profile
+            os.environ["ESP_RAINMAKER_PROFILE"] = new_profile
+            print(f"Successfully created and will use profile: {new_profile}")
+            return new_profile
+        else:
+            print("WARNING: Failed to create profile from base_url, will use configured profile")
+
+    return None
+
+def ensure_login(force_login=False):
+    """Ensure ESP RainMaker CLI is logged in"""
+    # Check if already logged in (unless forced)
+    if not force_login:
+        result = subprocess.run(
+            ["esp-rainmaker-cli", "getnodes"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+
+        # If we get nodes or a proper response, we're logged in
+        if result.returncode == 0 and not ("login" in result.stderr.lower() or "authentication" in result.stderr.lower()):
+            return True
 
     # Need to login
     email = os.environ.get("ESP_RAINMAKER_EMAIL")
     password = os.environ.get("ESP_RAINMAKER_PASSWORD")
-    profile = os.environ.get("ESP_RAINMAKER_PROFILE")
 
-    # Default to global if profile is not set or is null
+    # Determine which profile to use
+    profile = os.environ.get("ESP_RAINMAKER_PROFILE")
     if not profile or profile.lower() == "null" or profile.strip() == "":
-        profile = "global"
+        profile = "my_profile"
         print(f"Profile not set or null, defaulting to: {profile}")
 
     if not email or not password:
@@ -57,9 +173,15 @@ print(f"DEBUG: Environment variables on startup:")
 print(f"  ESP_RAINMAKER_EMAIL: {os.environ.get('ESP_RAINMAKER_EMAIL', 'NOT SET')}")
 print(f"  ESP_RAINMAKER_PASSWORD: {'SET' if os.environ.get('ESP_RAINMAKER_PASSWORD') else 'NOT SET'}")
 print(f"  ESP_RAINMAKER_PROFILE: {os.environ.get('ESP_RAINMAKER_PROFILE', 'NOT SET')}")
+print(f"  ESP_RAINMAKER_BASE_URL: {os.environ.get('ESP_RAINMAKER_BASE_URL', 'NOT SET')}")
 print(f"  RAINMAKER_API_PORT: {os.environ.get('RAINMAKER_API_PORT', 'NOT SET')}")
 
-login_success = ensure_login()
+# Manage profiles on startup if base_url is provided
+profile_created = manage_profiles_if_needed()
+
+# Force login if a new profile was created (since we logged out)
+# If profile was created, we already switched to it, so pass profile_already_switched=True
+login_success = ensure_login(force_login=(profile_created is not None))
 if not login_success:
     print("WARNING: Failed to login to ESP RainMaker. API endpoints may not work.")
 
@@ -351,15 +473,32 @@ def login_status():
     """Check ESP RainMaker login status"""
     is_logged_in = ensure_login()
     profile = os.environ.get("ESP_RAINMAKER_PROFILE")
+    base_url = os.environ.get("ESP_RAINMAKER_BASE_URL")
 
     # Apply same default logic as in ensure_login
-    if not profile or profile.lower() == "null" or profile.strip() == "":
-        profile = "global"
+    if base_url and base_url.strip() and base_url.lower() != "null":
+        # If base_url is set, we'll use the created profile
+        # Get the actual current profile from CLI
+        result = subprocess.run(
+            ["esp-rainmaker-cli", "profile", "current"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if result.returncode == 0:
+            # Extract profile name from output
+            for line in result.stdout.splitlines():
+                if "Profile:" in line or "Name:" in line:
+                    match = re.search(r'(?:Profile|Name):\s*(\w+)', line)
+                    if match:
+                        profile = match.group(1)
+                        break
+    elif not profile or profile.lower() == "null" or profile.strip() == "":
+        profile = "my_profile"
 
     return jsonify({
         "logged_in": is_logged_in,
         "email": os.environ.get("ESP_RAINMAKER_EMAIL", "Not set"),
         "profile": profile,
+        "base_url": base_url if base_url else "Not set",
         "service": "ESP RainMaker API"
     })
 

@@ -17,10 +17,12 @@ map:
 options:
   email: ""
   password: ""
-  profile: "global"
+  profile: "my_profile"
   api_port: 8100
+  base_url: "https://api.rainmaker.espressif.com/v1/"
 schema:
   email: str
   password: password
   profile: str
   api_port: port
+  base_url: str

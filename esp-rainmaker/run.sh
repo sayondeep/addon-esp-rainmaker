@@ -5,12 +5,14 @@ ESP_RAINMAKER_EMAIL=$(bashio::config 'email')
 ESP_RAINMAKER_PASSWORD=$(bashio::config 'password')
 ESP_RAINMAKER_PROFILE=$(bashio::config 'profile')
 RAINMAKER_API_PORT=$(bashio::config 'api_port')
+ESP_RAINMAKER_BASE_URL=$(bashio::config 'base_url')
 
 # Export environment variables
 export ESP_RAINMAKER_EMAIL
 export ESP_RAINMAKER_PASSWORD
 export ESP_RAINMAKER_PROFILE
 export RAINMAKER_API_PORT
+export ESP_RAINMAKER_BASE_URL
 
 # Create rainmaker data directory
 mkdir -p /data/rainmaker
@@ -30,6 +32,7 @@ bashio::log.info "Starting ESP RainMaker addon..."
 bashio::log.info "Email: ${ESP_RAINMAKER_EMAIL}"
 bashio::log.info "Profile: ${ESP_RAINMAKER_PROFILE}"
 bashio::log.info "API Port: ${RAINMAKER_API_PORT}"
+bashio::log.info "Base URL: ${ESP_RAINMAKER_BASE_URL}"
 
 # Start the server with proper signal handling
 exec python3 /app/server.py
