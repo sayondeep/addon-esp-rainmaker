@@ -1,17 +1,14 @@
 name: "ESP RainMaker"
 description: "ESP RainMaker integration addon for Home Assistant"
-version: "1.0.17"
+version: "0.0.1"
 slug: "esp-rainmaker"
 init: false
 arch:
-  - armhf
-  - armv7
   - aarch64
-  - amd64
-  - i386
 startup: application
 boot: auto
 host_network: true
+image: sayondeep/esp-rainmaker-addon
 map:
   - "share:rw"
 options:
