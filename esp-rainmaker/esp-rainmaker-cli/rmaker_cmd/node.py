@@ -1,0 +1,2315 @@
+# SPDX-FileCopyrightText: 2020-2025 Espressif Systems (Shanghai) CO LTD
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+import re
+import os
+import sys
+import time
+import datetime
+import requests
+import base64
+import re
+from pathlib import Path
+from rmaker_lib import session, configmanager
+from rmaker_lib.logger import log
+from rmaker_lib import node
+from rmaker_lib.exceptions import HttpErrorResponse, NetworkError, InvalidJSONError, SSLError,\
+    RequestTimeoutError
+from rmaker_lib.profile_utils import get_session_with_profile
+from rmaker_lib.schedule_utils import format_schedule_params, extract_schedules_from_node_details
+
+try:
+    from rmaker_lib import session, node, device, service,\
+        serverconfig, configmanager
+    from rmaker_lib.exceptions import HttpErrorResponse, NetworkError, InvalidJSONError, SSLError,\
+        RequestTimeoutError
+    from rmaker_lib.logger import log
+except ImportError as err:
+    print("Failed to import ESP Rainmaker library. " + str(err))
+    raise err
+
+MAX_HTTP_CONNECTION_RETRIES = 5
+
+
+def _get_cache_objects(vars_dict):
+    """
+    Create NodeCache and SessionStore instances based on current profile/user.
+    Returns (node_cache, session_store) or (None, None) if caching is disabled.
+    """
+    try:
+        from rmaker_lib.node_cache import NodeCache, is_cache_enabled, _get_cache_base_dir
+        from rmaker_lib.session_store import SessionStore
+
+        no_cache_flag = vars_dict.get('no_cache', False)
+        profile_override = vars_dict.get('profile')
+
+        config = configmanager.Config(profile_override=profile_override) if profile_override else configmanager.Config()
+        profile_name = config.get_current_profile_name()
+        profile_config = config.get_profile_config_for_current()
+
+        if not is_cache_enabled(profile_config, no_cache_flag):
+            return None, None
+
+        try:
+            user_id = config.get_user_id()
+        except Exception:
+            user_id = 'unknown'
+
+        base_dir = _get_cache_base_dir(profile_config)
+        cache_dir = os.path.join(base_dir, profile_name, user_id or 'unknown')
+
+        nc = NodeCache(profile_name, user_id, enabled=True)
+        ss = SessionStore(cache_dir, enabled=True)
+        return nc, ss
+    except Exception as e:
+        log.debug(f"Failed to initialize cache objects: {e}")
+        return None, None
+
+
+def _build_local_options_with_cache(vars_dict, node_cache=None, session_store=None):
+    """
+    Build local_options dict, enriched with cache objects and auto-POP resolution.
+    """
+    pop = vars_dict.get('pop', '')
+    raw_sec_ver = vars_dict.get('sec_ver')
+    explicit_sec_ver = raw_sec_ver is not None
+    sec_ver = raw_sec_ver if raw_sec_ver is not None else 1
+    nodeid = vars_dict.get('nodeid', '')
+
+    if node_cache and not pop:
+        capability = node_cache.get_local_control_capability(nodeid)
+        if capability:
+            if not capability.get('supported', True):
+                log.info(f"Node {nodeid} known to not support local control (cached)")
+                return None
+
+            if capability.get('pop_required') is False:
+                pop = ''
+                sec_ver = capability.get('sec_ver', 0)
+                explicit_sec_ver = True
+            elif capability.get('sec_ver') is not None and not explicit_sec_ver:
+                sec_ver = capability['sec_ver']
+
+        if not pop:
+            lc_info = node_cache.get_local_control_info(nodeid)
+            if lc_info and lc_info.get('pop'):
+                pop = lc_info['pop']
+                log.debug(f"Using cached POP for node {nodeid}")
+                if lc_info.get('sec_ver') is not None and not explicit_sec_ver:
+                    sec_ver = lc_info['sec_ver']
+
+        if not pop and not explicit_sec_ver:
+            try:
+                from rmaker_lib.profile_utils import get_session_with_profile
+                s = get_session_with_profile(vars_dict)
+                n = node.Node(nodeid, s)
+                cloud_params = n.get_node_params()
+                if cloud_params:
+                    from rmaker_lib.node_cache import extract_local_control_info
+                    lc_info = extract_local_control_info(cloud_params)
+                    if lc_info:
+                        node_cache.set_local_control_info(nodeid, lc_info)
+                        pop = lc_info.get('pop', '')
+                        if lc_info.get('sec_ver') is not None:
+                            sec_ver = lc_info['sec_ver']
+                        log.debug(f"Resolved POP from cloud for node {nodeid}")
+            except Exception as e:
+                log.debug(f"Failed to auto-resolve POP from cloud: {e}")
+
+    local_options = {
+        'pop': pop,
+        'transport': vars_dict.get('transport', 'http'),
+        'port': vars_dict.get('port', 8080),
+        'sec_ver': sec_ver,
+        'local_raw': vars_dict.get('local_raw', False),
+        'device_name': vars_dict.get('device_name', None),
+        'node_cache': node_cache,
+        'session_store': session_store,
+        'explicit_sec_ver': explicit_sec_ver,
+    }
+    return local_options
+
+def _try_local_operation(vars_dict, operation, data=None):
+    """
+    Attempt a local control operation. Returns the result on success, None on failure.
+    Used by --auto to try local before falling back to cloud.
+    """
+    try:
+        from rmaker_tools.rmaker_local_ctrl.integration import run_local_control_sync
+
+        nc, ss = _get_cache_objects(vars_dict)
+        local_options = _build_local_options_with_cache(vars_dict, nc, ss)
+        if local_options is None:
+            log.debug("Auto: node does not support local control (cached), skipping local")
+            return None
+
+        result = run_local_control_sync(
+            vars_dict['nodeid'], operation, data, **local_options
+        )
+
+        if result is not None:
+            log.info("Auto: local control succeeded")
+            if nc:
+                if operation == 'get_config':
+                    nc.set_node_config(vars_dict['nodeid'], result)
+                elif operation == 'get_params':
+                    from rmaker_lib.node_cache import extract_local_control_info
+                    lc_info = extract_local_control_info(result)
+                    if lc_info:
+                        nc.set_local_control_info(vars_dict['nodeid'], lc_info)
+        return result
+    except Exception as e:
+        log.debug(f"Auto: local control attempt failed: {e}")
+        return None
+
+
+def _format_schedule(schedule):
+    """
+    Helper function to format schedule information in a readable way
+
+    :param schedule: Schedule object from node params
+    :type schedule: dict
+
+    :return: Formatted schedule string
+    :rtype: str
+    """
+    schedule_str = []
+
+    # Add name and ID
+    name = schedule.get('name', 'Unnamed')
+    schedule_id = schedule.get('id', 'Unknown ID')
+    enabled = schedule.get('enabled', False)
+    status = "Enabled" if enabled else "Disabled"
+
+    schedule_str.append(f"Name: {name} (ID: {schedule_id}, {status})")
+
+    # Add info and flags if present
+    if 'info' in schedule:
+        schedule_str.append(f"Info: {schedule.get('info')}")
+
+    if 'flags' in schedule:
+        schedule_str.append(f"Flags: {schedule.get('flags')}")
+
+    # Format triggers
+    if 'triggers' in schedule:
+        for trigger_idx, trigger in enumerate(schedule.get('triggers', [])):
+            trigger_str = []
+
+            # Handle minutes since midnight (convert to time)
+            if 'm' in trigger:
+                minutes = trigger.get('m', 0)
+                hours = minutes // 60
+                mins = minutes % 60
+                time_str = f"{hours:02d}:{mins:02d}"
+                trigger_str.append(f"Time: {time_str}")
+
+            # Handle day bitmap
+            if 'd' in trigger:
+                d_value = trigger.get('d', 0)
+
+                # Check if it's one-time schedule
+                if d_value == 0:
+                    trigger_str.append("Once only")
+                else:
+                    # Parse bitmap for days
+                    days = []
+                    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+                    for day_idx in range(7):
+                        if (d_value & (1 << day_idx)) != 0:
+                            days.append(day_names[day_idx])
+
+                    # Check if it's all weekdays
+                    if d_value == 31:  # 0b00011111
+                        trigger_str.append("All weekdays")
+                    # Check if it's weekends
+                    elif d_value == 96:  # 0b01100000
+                        trigger_str.append("Weekends")
+                    # Check if it's all days
+                    elif d_value == 127:  # 0b01111111
+                        trigger_str.append("Every day")
+                    else:
+                        trigger_str.append(f"On: {', '.join(days)}")
+
+            # Handle specific date
+            if 'dd' in trigger:
+                dd_value = trigger.get('dd', 1)
+                trigger_str.append(f"Date: {dd_value}")
+
+                # Handle month bitmap if present
+                if 'mm' in trigger:
+                    mm_value = trigger.get('mm', 0)
+                    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                    months = []
+
+                    for month_idx in range(12):
+                        if (mm_value & (1 << month_idx)) != 0:
+                            months.append(month_names[month_idx])
+
+                    trigger_str.append(f"Months: {', '.join(months)}")
+
+                # Handle year
+                if 'yy' in trigger:
+                    yy_value = trigger.get('yy', 0)
+                    trigger_str.append(f"Year: {yy_value}")
+
+                # Handle yearly repeat
+                if trigger.get('r', False):
+                    trigger_str.append("Repeats yearly")
+
+            # Handle timestamp and relative seconds fields
+            if 'ts' in trigger and 'rsec' in trigger:
+                ts_value = trigger.get('ts', 0)
+                rsec_value = trigger.get('rsec', 0)
+
+                # Always show rsec value
+                trigger_str.append(f"After {rsec_value} seconds")
+
+                # Only show timestamp if it's valid
+                if ts_value > 1000000000:  # Valid timestamp (after year 2001)
+                    ts_datetime = datetime.datetime.fromtimestamp(ts_value)
+                    formatted_ts = ts_datetime.strftime('%Y-%m-%d %H:%M:%S')
+                    trigger_str.append(f"Triggers at: {formatted_ts} (local time)")
+                # Don't print anything about invalid timestamps
+
+            # Handle timestamp alone (no rsec)
+            elif 'ts' in trigger:
+                ts_value = trigger.get('ts', 0)
+                # Only show if ts is valid
+                if ts_value > 1000000000:  # Valid timestamp (after year 2001)
+                    ts_datetime = datetime.datetime.fromtimestamp(ts_value)
+                    formatted_ts = ts_datetime.strftime('%Y-%m-%d %H:%M:%S')
+                    trigger_str.append(f"Triggers at: {formatted_ts} (local time)")
+
+            # Handle relative seconds alone (no ts)
+            elif 'rsec' in trigger:
+                rsec_value = trigger.get('rsec', 0)
+                trigger_str.append(f"After {rsec_value} seconds")
+
+            schedule_str.append(f"  Trigger {trigger_idx+1}: {', '.join(trigger_str)}")
+
+    # Format actions
+    if 'action' in schedule:
+        actions = []
+        action_obj = schedule.get('action', {})
+
+        for device_name, device_action in action_obj.items():
+            action_details = []
+            for param, value in device_action.items():
+                action_details.append(f"{param}: {value}")
+
+            actions.append(f"{device_name}: {', '.join(action_details)}")
+
+        schedule_str.append(f"  Action: {'; '.join(actions)}")
+
+    return "\n".join(schedule_str)
+
+def get_nodes(vars=None):
+    """
+    List all nodes associated with the user.
+
+    :param vars: Optional parameters including 'profile'
+    :type vars: dict | None
+
+    :raises Exception: If there is an HTTP issue while getting nodes
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        s = get_session_with_profile(vars or {})
+        nodes = s.get_nodes()
+    except Exception as get_nodes_err:
+        log.error(get_nodes_err)
+    else:
+        if len(nodes.keys()) == 0:
+            print('User is not associated with any nodes.')
+            return
+        for idx, key in enumerate(nodes.keys(), 1):
+            print(f"{idx}. {nodes[key].get_nodeid()}")
+    return
+
+def get_node_details(vars=None):
+    """
+    Get detailed information for all nodes including config, status, and params.
+
+    :param vars: Optional parameters:
+                 `raw` as key - If True, prints raw JSON output
+                 `nodeid` as key - Single node ID to get details for
+                 `profile` as key - Profile to use for the operation
+    :type vars: dict | None
+
+    :raises Exception: If there is an HTTP issue while getting node details
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        s = get_session_with_profile(vars or {})
+        raw_output = vars.get('raw', False) if vars else False
+        node_id = vars.get('nodeid') if vars else None
+
+        # Get node details with filters if provided
+        if node_id:
+            # Make targeted API call for a single node
+            node_details = s.get_node_details_by_id(node_id)
+
+            if not node_details or 'node_details' not in node_details or len(node_details['node_details']) == 0:
+                print(f'No details available for node {node_id}.')
+                return
+        else:
+            # Get all nodes
+            node_details = s.get_node_details()
+
+            if not node_details or 'node_details' not in node_details or len(node_details['node_details']) == 0:
+                print('No node details available or user is not associated with any nodes.')
+                return
+
+        try:
+            nc, _ = _get_cache_objects(vars or {})
+            if nc and node_details and 'node_details' in node_details:
+                for ninfo in node_details['node_details']:
+                    nid = ninfo.get('id')
+                    if nid:
+                        nc.set_node_details(nid, ninfo)
+                        params_data = ninfo.get('params', {})
+                        if params_data:
+                            from rmaker_lib.node_cache import extract_local_control_info
+                            lc_info = extract_local_control_info(params_data)
+                            if lc_info:
+                                nc.set_local_control_info(nid, lc_info)
+        except Exception:
+            pass
+
+        if raw_output:
+            print(json.dumps(node_details, indent=4))
+            return
+
+        for idx, node_info in enumerate(node_details['node_details'], 1):
+            node_id = node_info.get('id', 'Unknown')
+            _print_node_details(node_id, node_info, idx)
+            print()
+    except Exception as e:
+        error_msg = f"Error retrieving node details: {str(e)}"
+        log.error(error_msg)
+
+def _print_node_details(node_id, node_info, index=None):
+    """
+    Helper function to print formatted node details
+
+    :param node_id: ID of the node
+    :type node_id: str
+    :param node_info: Node information dictionary
+    :type node_info: dict
+    :param index: Optional index number for the node
+    :type index: int | None
+
+    :return: None
+    :rtype: None
+    """
+    print(f"{'=' * 50}")
+    if index is not None:
+        print(f"{index}. Node ID: {node_id}")
+    else:
+        print(f"Node ID: {node_id}")
+    print(f"{'=' * 50}")
+
+    # Print connectivity status
+    status = node_info.get('status', {})
+    connectivity = status.get('connectivity', {})
+    connected = connectivity.get('connected', False)
+    timestamp = connectivity.get('timestamp', 0)
+
+    if connected:
+        print(f"\nStatus: Online")
+    else:
+        if timestamp:
+            timestamp_str = datetime.datetime.fromtimestamp(timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"\nStatus: Offline since {timestamp_str}")
+        else:
+            print(f"\nStatus: Offline")
+
+    # Print config information
+    config = node_info.get('config', {})
+    print(f"\nConfig:")
+
+    # Print node info
+    info = config.get('info', {})
+    if info:
+        print(f"  Info:")
+        print(f"    Name: {info.get('name', 'N/A')}")
+        print(f"    Type: {info.get('type', 'N/A')}")
+        print(f"    Model: {info.get('model', 'N/A')}")
+        print(f"    Firmware Version: {info.get('fw_version', 'N/A')}")
+
+    # Print node-level attributes if any
+    attributes = config.get('attributes', [])
+    if attributes:
+        print(f"\n  Attributes:")
+        for attr in attributes:
+            print(f"    {attr.get('name', 'N/A')}: {attr.get('value', 'N/A')}")
+
+    # Get params to use later
+    params = node_info.get('params', {})
+
+    # Print devices information with their params
+    devices = config.get('devices', [])
+    if devices:
+        print(f"\n  Devices:")
+        for i, device in enumerate(devices):
+            device_name = device.get('name', 'N/A')
+            print(f"    Device {i+1}:")
+            print(f"      Name: {device_name}")
+            print(f"      Type: {device.get('type', 'N/A')}")
+
+            # Print device attributes if any
+            attributes = device.get('attributes', [])
+            if attributes:
+                print(f"      Attributes:")
+                for attr in attributes:
+                    print(f"        {attr.get('name', 'N/A')}: {attr.get('data_type', 'N/A')}")
+
+            # Print device parameters with their types
+            if device_name in params:
+                print(f"      Parameters:")
+                device_params = params.get(device_name, {})
+                # Find parameter types from the device config
+                param_types = {}
+                for param_config in device.get('params', []):
+                    param_types[param_config.get('name')] = param_config.get('type', 'N/A')
+
+                for param_name, param_value in device_params.items():
+                    param_type = param_types.get(param_name, 'N/A')
+                    print(f"        {param_name}: {param_value} ({param_type})")
+
+    # Print services information with their params
+    services = config.get('services', [])
+    if services:
+        print(f"\n  Services:")
+        for i, service in enumerate(services):
+            service_name = service.get('name', 'N/A')
+            print(f"    Service {i+1}:")
+            print(f"      Name: {service_name}")
+            print(f"      Type: {service.get('type', 'N/A')}")
+
+            # Print service parameters with their types
+            if service_name in params:
+                print(f"      Parameters:")
+                service_params = params.get(service_name, {})
+                # Find parameter types from the service config
+                param_types = {}
+                for param_config in service.get('params', []):
+                    param_types[param_config.get('name')] = param_config.get('type', 'N/A')
+
+                for param_name, param_value in service_params.items():
+                    param_type = param_types.get(param_name, 'N/A')
+
+                    # Format schedules if this is the Schedules parameter
+                    if param_name == "Schedules" and param_type == "esp.param.schedules" and isinstance(param_value, list):
+                        print(f"        {param_name}: ({param_type})")
+                        if param_value:
+                            for idx, schedule in enumerate(param_value):
+                                print(f"          Schedule {idx+1}:")
+                                formatted_schedule = _format_schedule(schedule)
+                                for line in formatted_schedule.split('\n'):
+                                    print(f"            {line}")
+                        else:
+                            print(f"          No schedules defined")
+                    else:
+                        print(f"        {param_name}: {param_value} ({param_type})")
+
+    # Print additional metadata
+    if node_info.get('metadata'):
+        print(f"\nMetadata: {json.dumps(node_info.get('metadata'), indent=2)}")
+
+    if node_info.get('tags'):
+        print(f"\nTags: {', '.join(node_info.get('tags'))}")
+
+    # Only show Node Type if it has a value
+    node_type = node_info.get('node_type')
+    if node_type and node_type != 'N/A':
+        print(f"\nNode Type: {node_type}")
+
+    print(f"User Role: {node_info.get('role', 'N/A')}")
+    print(f"Is Primary: {node_info.get('primary', False)}")
+    print(f"Is Matter: {node_info.get('is_matter', False)}")
+
+    if node_info.get('mapping_timestamp'):
+        mapping_time = datetime.datetime.fromtimestamp(node_info.get('mapping_timestamp')).strftime('%Y-%m-%d %H:%M:%S')
+        print(f"Mapping Timestamp: {mapping_time}")
+
+    # Only print Admin Access if it exists and is not N/A
+    admin_access = node_info.get('admin_access')
+    if admin_access and admin_access != 'N/A':
+        print(f"Admin Access: {admin_access}")
+
+def get_schedules(vars=None):
+    """
+    Get schedule information for a specific node.
+
+    :param vars: Parameters:
+                 `nodeid` as key - Node ID to fetch schedules for
+                 `profile` as key - Profile to use for the operation
+    :type vars: dict | None
+
+    :raises Exception: If there is an HTTP issue while getting node details
+
+    :return: None on Success
+    :rtype: None
+    """
+    if not vars or 'nodeid' not in vars:
+        print("Error: Node ID is required.")
+        return
+
+    node_id = vars['nodeid']
+
+    try:
+        s = get_session_with_profile(vars)
+
+        # Get node details for the specific node
+        node_details = s.get_node_details_by_id(node_id)
+
+        # Use the shared utility function to extract schedule information
+        schedule_info = extract_schedules_from_node_details(node_details, node_id)
+
+        # Handle errors
+        if 'error' in schedule_info:
+            print(schedule_info['error'])
+            return
+
+        # Check if schedules are supported
+        if not schedule_info['schedules_supported']:
+            if 'message' in schedule_info:
+                print(schedule_info['message'])
+            else:
+                print(f"Node {node_id} does not support schedules.")
+            return
+
+        # Print schedule support confirmation
+        print("Node supports schedules.")
+
+        # Display schedules
+        schedules = schedule_info['schedules']
+        if not schedules:
+            print("No schedules configured for this node.")
+            return
+
+        # Print each schedule using the existing formatter
+        for idx, schedule in enumerate(schedules):
+            print(f"\nSchedule {idx+1}:")
+            print(_format_schedule(schedule))
+
+    except Exception as e:
+        error_msg = f"Error retrieving schedules: {str(e)}"
+        log.error(error_msg)
+
+def set_schedule(vars=None):
+    """
+    Set schedule for a specific node or multiple nodes. This function supports adding, editing, removing, enabling, and disabling schedules.
+
+    :param vars: Parameters:
+                 `nodeid` as key - Node ID to set schedule for (or comma-separated list of node IDs)
+                 `operation` as key - Operation to perform (add, edit, remove, enable, disable)
+                 `id` as key - Schedule ID (required for edit, remove, enable, disable)
+                 `name` as key - Schedule name (required for add, optional for edit)
+                 `trigger` as key - JSON string of trigger configuration (required for add, optional for edit)
+                 `action` as key - JSON string of action configuration (required for add, optional for edit)
+                 `info` as key - Additional information (optional)
+                 `flags` as key - General purpose flags (optional)
+                 `profile` as key - Profile to use for this operation (optional)
+    :type vars: dict | None
+
+    :raises Exception: If there is an HTTP issue while setting schedule
+
+    :return: None on Success
+    :rtype: None
+    """
+    if not vars or 'nodeid' not in vars:
+        print("Error: Node ID is required.")
+        return
+
+    if 'operation' not in vars:
+        print("Error: Operation is required (add, edit, remove, enable, disable).")
+        return
+
+    # Parse node IDs (support both single and comma-separated)
+    node_ids = [node_id.strip() for node_id in vars['nodeid'].split(',')]
+    operation = vars['operation'].lower()
+
+    try:
+        # Use the shared utility function to format schedule parameters
+        # Only auto-generate ID if none was provided by user
+        auto_generate_id = vars.get('id') is None
+
+        params = format_schedule_params(
+            operation=operation,
+            schedule_id=vars.get('id'),
+            name=vars.get('name'),
+            trigger=vars.get('trigger'),  # Will be parsed as JSON string
+            action=vars.get('action'),    # Will be parsed as JSON string
+            info=vars.get('info'),
+            flags=vars.get('flags'),
+            auto_generate_id=auto_generate_id
+        )
+
+        # Extract generated ID for 'add' operations
+        generated_id = None
+        if operation == 'add' and 'Schedule' in params and 'Schedules' in params['Schedule']:
+            generated_id = params['Schedule']['Schedules'][0].get('id')
+
+    except ValueError as e:
+        print(f"Error: {str(e)}")
+        # Add helpful examples for common errors
+        if "Trigger configuration is required" in str(e):
+            print("Example: --trigger '{\"m\": 1110, \"d\": 31}' for 6:30 PM on weekdays")
+        elif "Action configuration is required" in str(e):
+            print("Example: --action '{\"Light\": {\"Power\": true}}' to turn on a light")
+        return
+
+    try:
+        # Set the parameters on the node(s) using profile-aware session
+        curr_session = get_session_with_profile(vars)
+
+        # Create batch format for all cases (single and multiple nodes)
+        node_params_list = []
+        for node_id in node_ids:
+            node_params_list.append({
+                "node_id": node_id,
+                "payload": params
+            })
+
+        result = node.Node.set_node_params_multiple(node_params_list, curr_session)
+
+        # Determine operation string for messages
+        op_str = {
+            'add': 'added',
+            'edit': 'updated',
+            'remove': 'removed',
+            'enable': 'enabled',
+            'disable': 'disabled'
+        }.get(operation, operation)
+
+        # Provide detailed feedback based on results
+        if len(node_ids) == 1:
+            if result.get("success", True):
+                if operation == 'add' and generated_id:
+                    print(f"Schedule successfully {op_str} with ID: {generated_id}")
+                else:
+                    print(f"Schedule successfully {op_str}.")
+            else:
+                failed = result.get("failed_nodes", [])
+                if failed:
+                    print(f"Failed to {operation} schedule: {failed[0].get('description', 'Unknown error')}")
+                else:
+                    print(f"Failed to {operation} schedule.")
+        else:
+            successful_nodes = result.get("successful_nodes", [])
+            failed_nodes = result.get("failed_nodes", [])
+            total_nodes = len(node_ids)
+
+            if result.get("success", True):
+                if operation == 'add' and generated_id:
+                    print(f"Schedule successfully {op_str} with ID: {generated_id} for all {total_nodes} nodes")
+                else:
+                    print(f"Schedule successfully {op_str} for all {total_nodes} nodes.")
+            else:
+                if operation == 'add' and generated_id:
+                    print(f"Schedule {op_str} with ID: {generated_id} for {len(successful_nodes)} of {total_nodes} nodes")
+                else:
+                    print(f"Schedule {op_str} for {len(successful_nodes)} of {total_nodes} nodes.")
+                if failed_nodes:
+                    print('Failed nodes:')
+                    for failed in failed_nodes:
+                        node_id = failed.get("node_id", "unknown")
+                        description = failed.get("description", "Unknown error")
+                        print(f'  - {node_id}: {description}')
+
+    except Exception as e:
+        error_msg = f"Error setting schedule: {str(e)}"
+        log.error(error_msg)
+
+def _check_user_input(node_ids_str):
+    log.debug("Check user input....")
+    # Check user input format
+    input_pattern = re.compile("^[0-9A-Za-z]+(,[0-9A-Za-z]+)*$")
+    result = input_pattern.match(node_ids_str)
+    log.debug("User input result: {}".format(result))
+    if result is None:
+        sys.exit("Invalid format. Expected: <nodeid>,<nodeid>,... (no spaces)")
+    return True
+
+def _print_api_error(node_json_resp):
+    print("{:<7} ({}):  {}".format(
+        node_json_resp['status'].capitalize(),
+        node_json_resp['error_code'],
+        node_json_resp['description'])
+        )
+
+def _set_node_ids_list(node_ids):
+    # Create list from node ids string
+    node_id_list = node_ids.split(',')
+    node_id_list = [ item.strip() for item in node_id_list ]
+    log.debug("Node ids list: {}".format(node_id_list))
+    return node_id_list
+
+def sharing_request_op(accept_request=False, request_id=None, profile_override=None):
+    """
+    Accept or Decline the sharing request.
+
+    :param accept_request: Request to accept or decline the request
+    :type accept_request: bool
+
+    :param request_id: Request ID for accept/decline
+    :type request_id: str
+
+    :param profile_override: Optional profile to use for this operation
+    :type profile_override: str
+
+    :raises Exception: If there is an issue
+                       while accept/decline request
+
+    :return: API response
+    :rtype: dict
+    """
+    # Create API data dictionary
+    api_data = {}
+    api_data['accept'] = accept_request
+    api_data['request_id'] = request_id
+
+    # Use profile-aware session
+    vars_dict = {'profile': profile_override} if profile_override else {}
+    curr_session = get_session_with_profile(vars_dict)
+    node_obj = node.Node(None, curr_session)
+    log.debug("API data set: {}".format(api_data))
+
+    # API to accept or decline node sharing request
+    node_json_resp = node_obj.request_op(api_data)
+    log.debug("Sharing request API response: {}".format(node_json_resp))
+
+    return node_json_resp
+
+def list_sharing_details(node_id=None, primary_user=False, request_id=None, list_requests=False, profile_override=None):
+    """
+    List sharing details of all nodes associated with user
+    or List pending requests
+
+    :param node_id: Node Id of the node(s)
+                 (if not provided, is set to all nodes associated with user)
+    :type node_id: str
+
+    :param primary_user: User is primary or secondary
+                 (if provided, user is primary user)
+    :type primary_user: bool
+
+    :param request_id: Id of sharing request
+    :type request_id: str
+
+    :param list_requests:
+                 If True, list pending requests
+                 If False, list sharing details of nodes
+    :type list_requests: bool
+
+    :param profile_override: Optional profile to use for this operation
+    :type profile_override: str
+
+    :raises Exception: If there is an issue
+                       while listing details
+
+    :return: API response
+    :rtype: dict
+    """
+    # Use profile-aware session
+    vars_dict = {'profile': profile_override} if profile_override else {}
+    curr_session = get_session_with_profile(vars_dict)
+    node_obj = node.Node(node_id, curr_session)
+    log.debug("Node id received from user: {}".format(node_id))
+
+    # Set data for listing pending requests
+    if list_requests:
+        # Create API query params
+        api_params = {}
+        if request_id:
+            api_params['id'] = request_id
+        api_params['primary_user'] = "{}".format(primary_user)
+
+        node_json_resp = node_obj.get_shared_nodes_request(api_params)
+        log.debug("List sharing request response: {}".format(node_json_resp))
+    else:
+        # Get sharing details of all nodes associated with user
+        # API
+        node_json_resp = node_obj.get_sharing_details_of_nodes()
+        log.debug("Get shared nodes response: {}".format(node_json_resp))
+
+    return node_json_resp
+
+def add_user_to_share_nodes(nodes=None, user=None, profile_override=None):
+    """
+    Add user to share nodes
+
+    :param nodes: Node Id of the node(s)
+    :type nodes: str
+
+    :param user: User name
+    :type user: str
+
+    :param profile_override: Optional profile to use for this operation
+    :type profile_override: str
+
+    :raises Exception: If there is an issue
+                       while adding user to share nodes
+
+    :return: API response
+    :rtype: dict
+    """
+    log.debug("Adding user to share nodes")
+
+    # Remove any spaces if exist
+    nodes = nodes.strip()
+    # Check user input format
+    ret_status = _check_user_input(nodes)
+    # Create list from node ids string
+    node_id_list = _set_node_ids_list(nodes)
+    log.debug("Node ids list: {}".format(node_id_list))
+
+    log.debug("User name is set: {}".format(user))
+
+    # Create API input info
+    api_input = {}
+    api_input['nodes'] = node_id_list
+    api_input['user_name'] = user
+    log.debug("API data set: {}".format(api_input))
+
+    # API with profile-aware session
+    vars_dict = {'profile': profile_override} if profile_override else {}
+    curr_session = get_session_with_profile(vars_dict)
+    node_obj = node.Node(None, curr_session)
+    node_json_resp = node_obj.add_user_for_sharing(api_input)
+    log.debug("Set shared nodes response: {}".format(node_json_resp))
+
+    return node_json_resp
+
+def remove_sharing(nodes=None, user=None, request_id=None, profile_override=None):
+    """
+    Remove user from shared nodes or
+    Remove sharing request
+
+    :param nodes: Node Id for the node
+    :type nodes: str
+
+    :param user: User name
+    :type user: str
+
+    :param request_id: Id of sharing request
+    :type request_id: str
+
+    :param profile_override: Optional profile to use for this operation
+    :type profile_override: str
+
+    :raises Exception: If there is an issue
+                       while remove operation
+
+    :return: API response
+    :rtype: dict
+    """
+    print('\nPlease make sure current (logged-in) user is Primary user\n')
+
+    node_json_resp = None
+    # Use profile-aware session
+    vars_dict = {'profile': profile_override} if profile_override else {}
+    curr_session = get_session_with_profile(vars_dict)
+    node_obj = node.Node(None, curr_session)
+
+    if request_id:
+        # API call to remove the shared nodes request
+        node_json_resp = node_obj.remove_shared_nodes_request(request_id)
+        log.debug("Remove sharing request response: {}".format(node_json_resp))
+    else:
+        # Remove any spaces if exist
+        node_ids = nodes.strip()
+
+        # Check user input format
+        ret_status = _check_user_input(node_ids)
+
+        # Create API query params dictionary
+        api_params = {}
+        api_params['nodes'] = node_ids
+        api_params['user_name'] = user
+        log.debug("API data set to: {}".format(api_params))
+
+        # API call to remove the shared nodes
+        node_json_resp = node_obj.remove_user_from_shared_nodes(api_params)
+        log.debug("Remove user from shared nodes response: {}".format(node_json_resp))
+
+    return node_json_resp
+
+def _get_status(resp):
+    return(resp['status'].capitalize())
+
+def _get_description(resp):
+    return(resp['description'])
+
+def _get_request_id(resp):
+    return(resp['request_id'])
+
+def _get_request_expiration(request):
+    total_expiry_days = 7
+    expiration_str = ""
+
+    curr_time = datetime.datetime.now()
+    log.debug("Current time is set to: {}".format(curr_time))
+
+    creation_time = datetime.datetime.fromtimestamp(request['request_timestamp'])
+    log.debug("Creation timestamp received : {}".format(creation_time))
+
+    timedelta = curr_time - creation_time
+    log.debug("Timedelta is : {}".format(timedelta))
+    days_left = total_expiry_days - timedelta.days
+    log.debug("Days left for request to expire: {}".format(days_left))
+    if days_left <= 0:
+        expiration_str = "** Request expired **"
+    elif days_left == 1:
+        expiration_str = "** Request will expire today **"
+    else:
+        expiration_str = "** Request will expire in {} day(s) **".format(days_left)
+    log.debug("Expiration is: {}".format(expiration_str))
+    return expiration_str
+
+def _print_request_details(resp, is_primary_user=False):
+    try:
+        log.debug("Printing request details")
+        requests_in_resp = resp['sharing_requests']
+        request_exists = False
+        if not requests_in_resp:
+            print("No pending requests")
+            return
+        for request in requests_in_resp:
+            nodes_str = ""
+            if request['request_status'].lower() == 'declined':
+                continue
+            request_exists = True
+            print("\n{:<12}: {}".format('Request Id',request['request_id']))
+            for n_id in request['node_ids']:
+                nodes_str += "{},".format(n_id)
+            nodes_str = nodes_str.rstrip(',')
+            print("{:<12}: {}".format('Node Id(s)', nodes_str))
+            if is_primary_user:
+                print("{:<12}: {}".format('Shared with', request['user_name']))
+            else:
+                print("{:<12}: {}".format('Shared by', request['primary_user_name']))
+            expiration_msg = _get_request_expiration(request)
+            print(expiration_msg)
+
+        if not request_exists:
+            print("No pending requests")
+
+    except KeyError as err:
+        print(err)
+        log.debug("Key Error while printing request details: {}".format(err))
+        print("Error in displaying details...Please check API Json...Exiting...")
+        sys.exit(0)
+    log.debug("Done printing request details")
+
+def _print_sharing_details(resp):
+    try:
+        log.debug("Printing sharing details of nodes")
+        nodes_in_resp = resp['node_sharing']
+        for nodes in nodes_in_resp:
+            primary_users = ""
+            secondary_users = ""
+            print("\nNode Id: {}".format(nodes['node_id']))
+
+            for user in nodes['users']['primary']:
+                primary_users += "{},".format(user)
+            primary_users = primary_users.rstrip(',')
+            print("{:<7}: {:<9}: {}".format('Users', 'Primary', primary_users), end='')
+
+            if 'secondary' in nodes['users'].keys():
+                for user in nodes['users']['secondary']:
+                    secondary_users += "{},".format(user)
+                secondary_users = secondary_users.rstrip(',')
+                print("\n{:>18}: {}".format('Secondary', secondary_users), end='')
+            print()
+
+    except KeyError as err:
+        log.debug("Key Error while printing sharing details of nodes: {}".format(err))
+        print("Error in displaying details...Please check API Json...Exiting...")
+        sys.exit(0)
+    log.debug("Done printing sharing details of nodes")
+
+'''
+Node Sharing operations based on user input
+'''
+def node_sharing_ops(vars=None):
+    try:
+        op = ""
+
+        log.debug("Performing Node Sharing operations")
+
+        # Set action if given
+        try:
+            action = vars['sharing_ops'].lower()
+        except AttributeError:
+            print(vars['parser'].format_help())
+            sys.exit(0)
+
+        # Set operation to base action
+        op = action
+
+        # Get profile override if specified
+        profile_override = vars.get('profile')
+
+        if action == 'add_user':
+            # Share nodes with user
+            print("Adding user to share node(s)")
+            node_json_resp = add_user_to_share_nodes(nodes=vars['nodes'], user=vars['user'], profile_override=profile_override)
+
+            # Print success response
+            if 'status' in node_json_resp and node_json_resp['status'].lower() == 'success':
+                print("{:<11}: {}\n{:<11}: {}".format(
+                    _get_status(node_json_resp),
+                    _get_description(node_json_resp),
+                    'Request Id',
+                    _get_request_id(node_json_resp))
+                    )
+        elif action == "accept":
+            # Accept sharing request
+            node_json_resp = sharing_request_op(accept_request=True, request_id=vars['id'], profile_override=profile_override)
+
+            # Print success response
+            if 'status' in node_json_resp and node_json_resp['status'].lower() == 'success':
+                print("{:<11}: {}".format(
+                    _get_status(node_json_resp),
+                    _get_description(node_json_resp))
+                    )
+        elif action == "decline":
+            # Decline sharing request
+            node_json_resp = sharing_request_op(accept_request=False, request_id=vars['id'], profile_override=profile_override)
+
+            # Print success response
+            if 'status' in node_json_resp and node_json_resp['status'].lower() == 'success':
+                print("{:<11}: {}".format(
+                    _get_status(node_json_resp),
+                    _get_description(node_json_resp))
+                    )
+        elif action == "cancel":
+            log.debug("Performing action: {}".format(action))
+            # Cancel sharing request
+            print("Cancelling request")
+            node_json_resp = remove_sharing(request_id=vars['id'], profile_override=profile_override)
+
+            # Print success response
+            if 'status' in node_json_resp and node_json_resp['status'].lower() == 'success':
+                print("{}: {}".format(
+                    _get_status(node_json_resp),
+                    _get_description(node_json_resp))
+                    )
+        elif action == "remove_user":
+            log.debug("Performing action: {}".format(action))
+            # Remove nodes shared with user
+            print("Removing user from shared nodes")
+            node_json_resp = remove_sharing(nodes=vars['nodes'], user=vars['user'], profile_override=profile_override)
+
+            # Print success response
+            if 'status' in node_json_resp and node_json_resp['status'].lower() == 'success':
+                print("{}: {}".format(
+                    _get_status(node_json_resp),
+                    _get_description(node_json_resp))
+                    )
+        elif action == "list_nodes":
+            log.debug("Performing action: {}".format(action))
+
+            log.debug("List sharing details of nodes associated with user")
+            print("Displaying sharing details")
+            # List sharing details of all nodes associated with user
+            node_json_resp = list_sharing_details(node_id=vars['node'], profile_override=profile_override)
+
+            # Print success response
+            if 'node_sharing' in node_json_resp:
+                _print_sharing_details(node_json_resp)
+        elif action == "list_requests":
+            log.debug("Performing action: {}".format(action))
+
+            log.debug("List pending requests")
+            print("Displaying pending requests")
+            if vars['primary_user']:
+                print("Current (logged-in) user is set as Primary user")
+            else:
+                print("Current (logged-in) user is set as Secondary user")
+            # List pending sharing requests
+            node_json_resp = list_sharing_details(primary_user=vars['primary_user'],
+                                                    request_id=vars['id'],
+                                                    list_requests=True,
+                                                    profile_override=profile_override
+                                                    )
+            # Print success response
+            if 'sharing_requests' in node_json_resp:
+                _print_request_details(node_json_resp, is_primary_user=vars['primary_user'])
+
+    except Exception as get_node_status_err:
+        log.error(get_node_status_err)
+        return
+    else:
+        if 'status' in node_json_resp and node_json_resp['status'].lower() != 'success':
+            log.debug("Operation {} failed\nresp: {}".format(op, node_json_resp))
+            _print_api_error(node_json_resp)
+            return
+    log.debug("Operation `{}` was successful".format(op))
+
+def get_node_config(vars=None):
+    """
+    Shows the configuration of the node.
+
+    :param vars: `nodeid` as key - Node ID for the node
+                 `profile` as key - Profile to use for the operation
+                 `local` as key - Use local control instead of cloud
+                 `local_raw` as key - Use raw endpoints with fragmentation
+                 `pop`, `transport`, `port`, `sec_ver` - Local control options
+                 `device_name` as key - Device name for BLE transport
+                 `timestamp` as key - Timestamp for signed response
+                 `proxy_report` as key - POST signed response to proxy API endpoint
+    :type vars: dict | None
+
+    :raises Exception: If there is an HTTP issue while getting node config
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        node_config = None
+        proxy_report = vars.get('proxy_report', False) if vars else False
+
+        # Check if local-raw mode is requested (raw endpoints with fragmentation)
+        if vars and vars.get('local_raw', False):
+            try:
+                from rmaker_tools.rmaker_local_ctrl.raw_config import run_raw_config_sync
+                import time
+
+                # Handle timestamp for proxy_report
+                timestamp = vars.get('timestamp', None)
+                if proxy_report and timestamp is None:
+                    timestamp = int(time.time())
+                elif timestamp == 0:
+                    timestamp = int(time.time())
+
+                local_options = {
+                    'pop': vars.get('pop', ''),
+                    'transport': vars.get('transport', 'ble'),
+                    'port': vars.get('port', 8080),
+                    'sec_ver': vars.get('sec_ver') if vars.get('sec_ver') is not None else 1,
+                    'device_name': vars.get('device_name', None),
+                    'timestamp': timestamp
+                }
+
+                node_config = run_raw_config_sync(
+                    vars['nodeid'], **local_options
+                )
+
+            except Exception as e:
+                log.error(f"Raw config retrieval failed: {e}")
+                import traceback
+                log.debug(traceback.format_exc())
+
+        elif vars and vars.get('auto', False):
+            node_config = _try_local_operation(vars, 'get_config')
+            if node_config is None:
+                log.info("Auto: local failed, falling back to cloud")
+                s = get_session_with_profile(vars or {})
+                n = node.Node(vars['nodeid'], s)
+                node_config = n.get_node_config()
+                if node_config:
+                    try:
+                        nc, _ = _get_cache_objects(vars or {})
+                        if nc:
+                            nc.set_node_config(vars['nodeid'], node_config)
+                    except Exception:
+                        pass
+
+        elif vars and vars.get('local', False):
+            try:
+                from rmaker_tools.rmaker_local_ctrl.integration import run_local_control_sync
+
+                nc, ss = _get_cache_objects(vars)
+                local_options = _build_local_options_with_cache(vars, nc, ss)
+                if local_options is None:
+                    log.error("Node does not support local control (cached)")
+                    node_config = None
+                else:
+                    node_config = run_local_control_sync(
+                        vars['nodeid'], 'get_config', **local_options
+                    )
+                    if node_config and nc:
+                        nc.set_node_config(vars['nodeid'], node_config)
+
+            except Exception as e:
+                log.debug(f"Standalone integration failed: {e}")
+                try:
+                    from rmaker_lib.local_control import run_local_control_operation
+
+                    local_options = {
+                        'pop': vars.get('pop', ''),
+                        'transport': vars.get('transport', 'http'),
+                        'port': vars.get('port', 8080),
+                        'sec_ver': vars.get('sec_ver') if vars.get('sec_ver') is not None else 1
+                    }
+
+                    node_config = run_local_control_operation(
+                        vars['nodeid'], 'get_config', **local_options
+                    )
+                except Exception as e2:
+                    log.debug(f"Direct local control failed: {e2}")
+                    from rmaker_lib.simple_local_control import run_simple_local_control_operation
+
+                    local_options = {
+                        'pop': vars.get('pop', ''),
+                        'transport': vars.get('transport', 'http'),
+                        'port': vars.get('port', 8080),
+                        'sec_ver': vars.get('sec_ver') if vars.get('sec_ver') is not None else 0
+                    }
+
+                    log.info("Using simplified local control (security level 0)")
+                    node_config = run_simple_local_control_operation(
+                        vars['nodeid'], 'get_config', **local_options
+                    )
+        else:
+            s = get_session_with_profile(vars or {})
+            n = node.Node(vars['nodeid'], s)
+            node_config = n.get_node_config()
+
+            if node_config:
+                try:
+                    nc, _ = _get_cache_objects(vars or {})
+                    if nc:
+                        nc.set_node_config(vars['nodeid'], node_config)
+                except Exception:
+                    pass
+
+    except Exception as get_nodes_err:
+        log.error(get_nodes_err)
+    else:
+        if node_config is None:
+            log.error('Failed to get node configuration')
+            return node_config
+
+        # If proxy_report is enabled and we got a signed response, POST it to proxy API
+        if proxy_report:
+            if isinstance(node_config, dict) and 'node_payload' in node_config and 'signature' in node_config:
+                # Print the JSON received from the node
+                print("JSON received from node:")
+                print(json.dumps(node_config, indent=4))
+                print()
+
+                try:
+                    s = get_session_with_profile(vars or {})
+                    node_id = vars['nodeid']
+                    path = f'user/nodes/{node_id}/proxy/config'
+                    proxy_url = s.config.get_host() + path
+
+                    # Convert node_payload to escaped JSON string if it's a dict
+                    # (backend expects node_payload as a JSON string, not an object)
+                    proxy_config = node_config.copy()
+                    if isinstance(proxy_config.get('node_payload'), dict):
+                        # Convert to compact JSON string (matching backend expectation)
+                        proxy_config['node_payload'] = json.dumps(proxy_config['node_payload'], separators=(',', ':'))
+
+                    log.info(f"POSTing signed config to proxy API: {proxy_url}")
+                    log.debug(f"Proxy API payload: {json.dumps(proxy_config, indent=2)}")
+
+                    response = requests.post(
+                        url=proxy_url,
+                        headers=s.request_header,
+                        json=proxy_config,
+                        verify=configmanager.CERT_FILE,
+                        timeout=(5.0, 5.0)
+                    )
+                    response.raise_for_status()
+                    response_json = response.json()
+                    log.info("Successfully posted signed config to proxy API")
+                    log.info(f"Proxy API response: {json.dumps(response_json)}")
+                    print("Signed config posted to proxy API successfully")
+                    print(json.dumps(response_json, indent=4))
+                except requests.exceptions.HTTPError as http_err:
+                    log.error(f"Failed to POST to proxy API: {http_err}")
+                    if hasattr(http_err.response, 'json'):
+                        try:
+                            error_data = http_err.response.json()
+                            log.error(f"Error response: {json.dumps(error_data, indent=2)}")
+                            print(f"Error posting to proxy API: {error_data}")
+                        except:
+                            print(f"Error posting to proxy API: {http_err.response.text}")
+                    else:
+                        print(f"Error posting to proxy API: {http_err}")
+                except Exception as proxy_err:
+                    log.error(f"Failed to POST to proxy API: {proxy_err}")
+                    print(f"Error posting to proxy API: {proxy_err}")
+            else:
+                # proxy_report was set but we didn't get a signed response
+                log.warn("--proxy-report requires --local-raw with timestamp to get signed response")
+                print("Warning: No signed response available for proxy reporting")
+                print(json.dumps(node_config, indent=4))
+        else:
+            # Normal display of config
+            print(json.dumps(node_config, indent=4))
+
+    return node_config
+
+
+def get_node_status(vars=None):
+    """
+    Shows the online/offline status of the node.
+
+    :param vars: `nodeid` as key - Node ID for the node
+                 `profile` as key - Profile to use for the operation
+    :type vars: dict | None
+
+    :raises Exception: If there is an HTTP issue while getting node status
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        s = get_session_with_profile(vars or {})
+        n = node.Node(vars['nodeid'], s)
+        node_status = n.get_node_status()
+    except Exception as get_node_status_err:
+        log.error(get_node_status_err)
+    else:
+        print(json.dumps(node_status, indent=4))
+    return
+
+
+def set_params(vars=None):
+    """
+    Set parameters of the node(s).
+
+    :param vars: `nodeid` as key - Node ID for the node (or comma-separated list of node IDs)
+                 `data` as key - JSON data containing parameters to be set
+                 `filepath` as key - Path of the JSON file containing parameters
+                 `profile` as key - Profile to use for the operation
+                 `local` as key - Use local control instead of cloud
+                 `pop`, `transport`, `port`, `sec_ver` - Local control options
+    :type vars: dict | None
+
+    :raises NetworkError: If there is a network connection issue during
+                          HTTP request for setting node params
+    :raises Exception: If there is an HTTP issue while setting params or
+                       JSON format issue in HTTP response
+
+    :return: None on Success
+    :rtype: None
+    """
+
+    data = None
+    if vars['data']:
+        data = json.loads(vars['data'])
+    else:
+        with open(vars['filepath'], 'r') as data_file:
+            data = json.load(data_file)
+
+    # Parse node IDs (support both single and comma-separated)
+    node_ids = [node_id.strip() for node_id in vars['nodeid'].split(',')]
+
+    try:
+        if vars and vars.get('auto', False):
+            all_succeeded = True
+            for node_id in node_ids:
+                auto_vars = dict(vars)
+                auto_vars['nodeid'] = node_id
+                result = _try_local_operation(auto_vars, 'set_params', data)
+                if result is None or result is False:
+                    all_succeeded = False
+                    break
+
+            if all_succeeded and result is not None:
+                if len(node_ids) == 1:
+                    print('Node parameters updated successfully via local control.')
+                else:
+                    print(f'Local control: {len(node_ids)}/{len(node_ids)} nodes updated successfully.')
+                return
+            else:
+                log.info("Auto: local failed, falling back to cloud")
+
+            s = get_session_with_profile(vars or {})
+            node_params_list = []
+            for node_id in node_ids:
+                node_params_list.append({
+                    "node_id": node_id,
+                    "payload": data
+                })
+            result = node.Node.set_node_params_multiple(node_params_list, s)
+
+            if len(node_ids) == 1:
+                if result.get("success", True):
+                    print('Node state updated successfully.')
+                else:
+                    failed = result.get("failed_nodes", [])
+                    if failed:
+                        print(f'Failed to update node: {failed[0].get("description", "Unknown error")}')
+                    else:
+                        print('Failed to update node state.')
+            else:
+                successful_nodes = result.get("successful_nodes", [])
+                failed_nodes_list = result.get("failed_nodes", [])
+                total_nodes = len(node_ids)
+                if result.get("success", True):
+                    print(f'Parameters updated successfully for all {total_nodes} nodes.')
+                else:
+                    print(f'Parameters updated for {len(successful_nodes)} of {total_nodes} nodes.')
+                    if failed_nodes_list:
+                        print('Failed nodes:')
+                        for failed in failed_nodes_list:
+                            nid = failed.get("node_id", "unknown")
+                            desc = failed.get("description", "Unknown error")
+                            print(f'  - {nid}: {desc}')
+            return
+
+        elif vars and (vars.get('local', False) or vars.get('local_raw', False)):
+            try:
+                from rmaker_lib.local_control import run_local_control_operation
+
+                nc, ss = _get_cache_objects(vars)
+                local_options = _build_local_options_with_cache(vars, nc, ss)
+                if local_options is None:
+                    print('Node does not support local control (cached).')
+                    return
+
+                success_count = 0
+                failed_nodes = []
+
+                for node_id in node_ids:
+                    result = run_local_control_operation(
+                        node_id, 'set_params', data, **local_options
+                    )
+                    # Handle result - can be dict (from raw endpoints) or bool (from esp_local_ctrl)
+                    if isinstance(result, dict):
+                        # Raw endpoints return dict with status
+                        # Always display the response from device for raw endpoints
+                        if len(node_ids) == 1:
+                            print(f"Device response: {json.dumps(result, indent=2)}")
+
+                        if result.get('status') == 'success':
+                            success_count += 1
+                        else:
+                            failed_nodes.append(node_id)
+                    elif result:
+                        success_count += 1
+                    else:
+                        failed_nodes.append(node_id)
+
+            except ImportError:
+                # Fallback to simple implementation
+                from rmaker_lib.simple_local_control import run_simple_local_control_operation
+
+                local_options = {
+                    'pop': vars.get('pop', ''),
+                    'transport': vars.get('transport', 'http'),
+                    'port': vars.get('port', 8080),
+                    'sec_ver': vars.get('sec_ver') if vars.get('sec_ver') is not None else 0,
+                    'local_raw': vars.get('local_raw', False),
+                    'device_name': vars.get('device_name', None)
+                }
+
+                log.info("Using simplified local control (security level 0)")
+                success_count = 0
+                failed_nodes = []
+
+                for node_id in node_ids:
+                    result = run_simple_local_control_operation(
+                        node_id, 'set_params', data, **local_options
+                    )
+                    # Handle result - can be dict (from raw endpoints) or bool (from esp_local_ctrl)
+                    if isinstance(result, dict):
+                        # Raw endpoints return dict with status
+                        # Always display the response from device for raw endpoints
+                        if len(node_ids) == 1:
+                            print(f"Device response: {json.dumps(result, indent=2)}")
+
+                        if result.get('status') == 'success':
+                            success_count += 1
+                        else:
+                            failed_nodes.append(node_id)
+                    elif result:
+                        success_count += 1
+                    else:
+                        failed_nodes.append(node_id)
+
+            # Report results
+            if len(node_ids) == 1:
+                if success_count == 1:
+                    print('Node parameters updated successfully via local control.')
+                else:
+                    print('Failed to update node parameters via local control.')
+            else:
+                print(f'Local control: {success_count}/{len(node_ids)} nodes updated successfully.')
+                if failed_nodes:
+                    print(f'Failed nodes: {failed_nodes}')
+
+            # Return early to avoid cloud API processing
+            return
+        else:
+            # Use cloud API
+            s = get_session_with_profile(vars or {})
+
+            # Create batch format for all cases (single and multiple nodes)
+            node_params_list = []
+            for node_id in node_ids:
+                node_params_list.append({
+                    "node_id": node_id,
+                    "payload": data
+                })
+
+            result = node.Node.set_node_params_multiple(node_params_list, s)
+
+    except SSLError:
+        error_msg = "SSL verification failed"
+        log.error(error_msg)
+    except NetworkError as conn_err:
+        log.warn(conn_err)
+        print(conn_err)
+    except Exception as set_params_err:
+        error_msg = f"Error setting parameters: {set_params_err}"
+        log.error(error_msg)
+    else:
+        # Provide detailed feedback based on results
+        if len(node_ids) == 1:
+            if result.get("success", True):
+                print('Node state updated successfully.')
+            else:
+                failed = result.get("failed_nodes", [])
+                if failed:
+                    print(f'Failed to update node: {failed[0].get("description", "Unknown error")}')
+                else:
+                    print('Failed to update node state.')
+        else:
+            successful_nodes = result.get("successful_nodes", [])
+            failed_nodes = result.get("failed_nodes", [])
+            total_nodes = len(node_ids)
+
+            if result.get("success", True):
+                print(f'Parameters updated successfully for all {total_nodes} nodes.')
+            else:
+                print(f'Parameters updated for {len(successful_nodes)} of {total_nodes} nodes.')
+                if failed_nodes:
+                    print('Failed nodes:')
+                    for failed in failed_nodes:
+                        node_id = failed.get("node_id", "unknown")
+                        description = failed.get("description", "Unknown error")
+                        print(f'  - {node_id}: {description}')
+    return
+
+
+def get_params(vars=None):
+    """
+    Get parameters of the node.
+
+    :param vars: `nodeid` as key - Node ID for the node
+                 `profile` as key - Profile to use for the operation
+                 `local` as key - Use local control instead of cloud
+                 `pop`, `transport`, `port`, `sec_ver` - Local control options
+                 `proxy_report` as key - POST signed response to proxy API endpoint
+    :type vars: dict | None
+
+    :raises Exception: If there is an HTTP issue while getting params or
+                       JSON format issue in HTTP response
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        params = None
+        proxy_report = vars.get('proxy_report', False) if vars else False
+
+        if vars and vars.get('auto', False):
+            params = _try_local_operation(vars, 'get_params')
+            if params is None:
+                log.info("Auto: local failed, falling back to cloud")
+                s = get_session_with_profile(vars or {})
+                n = node.Node(vars['nodeid'], s)
+                params = n.get_node_params()
+                if params:
+                    try:
+                        nc, _ = _get_cache_objects(vars or {})
+                        if nc:
+                            from rmaker_lib.node_cache import extract_local_control_info
+                            lc_info = extract_local_control_info(params)
+                            if lc_info:
+                                nc.set_local_control_info(vars['nodeid'], lc_info)
+                    except Exception:
+                        pass
+
+        elif vars and (vars.get('local', False) or vars.get('local_raw', False)):
+            try:
+                from rmaker_tools.rmaker_local_ctrl.integration import run_local_control_sync
+                import time
+
+                timestamp = vars.get('timestamp', None)
+                timestamp_explicitly_provided = 'timestamp' in vars
+                if proxy_report and timestamp is None:
+                    timestamp = int(time.time())
+                elif timestamp == 0:
+                    timestamp = int(time.time())
+
+                nc, ss = _get_cache_objects(vars)
+                local_options = _build_local_options_with_cache(vars, nc, ss)
+                if local_options is None:
+                    log.error("Node does not support local control (cached)")
+                    params = None
+                else:
+                    local_options['timestamp'] = timestamp if not (proxy_report and vars.get('local_raw', False) and not timestamp_explicitly_provided) else timestamp
+                    local_options['proxy_report'] = proxy_report
+
+                    params = run_local_control_sync(
+                        vars['nodeid'], 'get_params', **local_options
+                    )
+
+                    if params and nc:
+                        from rmaker_lib.node_cache import extract_local_control_info
+                        lc_info = extract_local_control_info(params)
+                        if lc_info:
+                            nc.set_local_control_info(vars['nodeid'], lc_info)
+
+            except Exception as e:
+                log.debug(f"Standalone integration failed: {e}")
+                # Fallback to direct implementation
+                try:
+                    from rmaker_lib.local_control import run_local_control_operation
+                    import time
+
+                    # Handle timestamp: if proxy_report is set and no timestamp provided, use current time
+                    # If timestamp is 0, use current system time
+                    # For proxy_report with local_raw: if timestamp is explicitly provided, use original flow (send to node)
+                    # Otherwise, use ch_resp workaround (get params without timestamp, sign via ch_resp)
+                    timestamp = vars.get('timestamp', None)
+                    timestamp_explicitly_provided = 'timestamp' in vars  # Check if --timestamp was explicitly passed
+                    if proxy_report and timestamp is None:
+                        timestamp = int(time.time())
+                    elif timestamp == 0:
+                        timestamp = int(time.time())
+
+                    local_options = {
+                        'pop': vars.get('pop', ''),
+                        'transport': vars.get('transport', 'http'),
+                        'port': vars.get('port', 8080),
+                        'sec_ver': vars.get('sec_ver') if vars.get('sec_ver') is not None else 1,
+                        'local_raw': vars.get('local_raw', False),
+                        'device_name': vars.get('device_name', None),
+                        'timestamp': timestamp if not (proxy_report and vars.get('local_raw', False) and not timestamp_explicitly_provided) else timestamp,
+                        'proxy_report': proxy_report
+                    }
+
+                    params = run_local_control_operation(
+                        vars['nodeid'], 'get_params', **local_options
+                    )
+                except Exception as e2:
+                    log.debug(f"Direct local control failed: {e2}")
+                    from rmaker_lib.simple_local_control import run_simple_local_control_operation
+                    import time
+
+                    timestamp = vars.get('timestamp', None)
+                    timestamp_explicitly_provided = 'timestamp' in vars
+                    if proxy_report and timestamp is None:
+                        timestamp = int(time.time())
+                    elif timestamp == 0:
+                        timestamp = int(time.time())
+
+                    local_options = {
+                        'pop': vars.get('pop', ''),
+                        'transport': vars.get('transport', 'http'),
+                        'port': vars.get('port', 8080),
+                        'sec_ver': vars.get('sec_ver') if vars.get('sec_ver') is not None else 0,
+                        'local_raw': vars.get('local_raw', False),
+                        'device_name': vars.get('device_name', None),
+                        'timestamp': timestamp if not (proxy_report and vars.get('local_raw', False) and not timestamp_explicitly_provided) else timestamp,
+                        'proxy_report': proxy_report
+                    }
+
+                    log.info("Using simplified local control (security level 0)")
+                    params = run_simple_local_control_operation(
+                        vars['nodeid'], 'get_params', **local_options
+                    )
+        else:
+            s = get_session_with_profile(vars or {})
+            n = node.Node(vars['nodeid'], s)
+            params = n.get_node_params()
+
+            if params:
+                try:
+                    nc, _ = _get_cache_objects(vars or {})
+                    if nc:
+                        from rmaker_lib.node_cache import extract_local_control_info
+                        lc_info = extract_local_control_info(params)
+                        if lc_info:
+                            nc.set_local_control_info(vars['nodeid'], lc_info)
+                except Exception:
+                    pass
+
+    except SSLError:
+        error_msg = "SSL verification failed"
+        log.error(error_msg)
+    except NetworkError as conn_err:
+        log.warn(conn_err)
+        print(conn_err)
+    except Exception as get_params_err:
+        log.error(get_params_err)
+    else:
+        if params is None:
+            log.error('Node status not updated.')
+            return
+
+        # If proxy_report is enabled and we got a signed response, POST it to proxy API
+        if proxy_report:
+            if isinstance(params, dict) and 'node_payload' in params and 'signature' in params:
+                # Print the JSON received from the node
+                print("JSON received from node:")
+                print(json.dumps(params, indent=4))
+                print()
+
+                try:
+                    s = get_session_with_profile(vars or {})
+                    node_id = vars['nodeid']
+                    # Use initparams if --init flag is set, otherwise use params
+                    endpoint = 'initparams' if vars.get('init', False) else 'params'
+                    path = f'user/nodes/{node_id}/proxy/{endpoint}'
+                    proxy_url = s.config.get_host() + path
+
+                    # Convert node_payload to escaped JSON string if it's a dict
+                    # (backend expects node_payload as a JSON string, not an object)
+                    proxy_params = params.copy()
+                    if isinstance(proxy_params.get('node_payload'), dict):
+                        # Convert to compact JSON string (matching backend expectation)
+                        proxy_params['node_payload'] = json.dumps(proxy_params['node_payload'], separators=(',', ':'))
+
+                    log.info(f"POSTing signed response to proxy API: {proxy_url}")
+                    log.debug(f"Proxy API payload: {json.dumps(proxy_params, indent=2)}")
+
+                    response = requests.post(
+                        url=proxy_url,
+                        headers=s.request_header,
+                        json=proxy_params,
+                        verify=configmanager.CERT_FILE,
+                        timeout=(5.0, 5.0)
+                    )
+                    response.raise_for_status()
+                    response_json = response.json()
+                    log.info("Successfully posted signed response to proxy API")
+                    log.info(f"Proxy API response: {json.dumps(response_json)}")
+                    print("Signed response posted to proxy API successfully")
+                    print(json.dumps(response_json, indent=4))
+                except requests.exceptions.HTTPError as http_err:
+                    log.error(f"Failed to POST to proxy API: {http_err}")
+                    if hasattr(http_err.response, 'json'):
+                        try:
+                            error_data = http_err.response.json()
+                            log.error(f"Error response: {json.dumps(error_data, indent=2)}")
+                            print(f"Error posting to proxy API: {error_data}")
+                        except:
+                            print(f"Error posting to proxy API: {http_err.response.text}")
+                    else:
+                        print(f"Error posting to proxy API: {http_err}")
+                except Exception as proxy_err:
+                    log.error(f"Failed to POST to proxy API: {proxy_err}")
+                    print(f"Error posting to proxy API: {proxy_err}")
+            else:
+                # proxy_report was set but we didn't get a signed response
+                # This should only happen if local_raw is not used, since local_raw with proxy_report
+                # will use ch_resp endpoint to sign
+                if vars and vars.get('local_raw', False):
+                    log.warn("--proxy-report with --local-raw should have produced signed response via ch_resp endpoint")
+                else:
+                    log.warn("--proxy-report requires --local-raw to use ch_resp endpoint for signing")
+                print(json.dumps(params, indent=4))
+        else:
+            # Normal display of params
+            print(json.dumps(params, indent=4))
+    return params
+
+
+def remove_node(vars=None):
+    """
+    Removes the user node mapping.
+
+    :param vars: `nodeid` as key - Node ID for the node
+                 `profile` as key - Profile to use for the operation
+    :type vars: dict | None
+
+    :raises NetworkError: If there is a network connection issue during
+                          HTTP request for removing node
+    :raises Exception: If there is an HTTP issue while removing node or
+                       JSON format issue in HTTP response
+
+    :return: None on Success
+    :rtype: None
+    """
+    log.info('Removing user node mapping for node ' + vars['nodeid'])
+    try:
+        s = get_session_with_profile(vars or {})
+        n = node.Node(vars['nodeid'], s)
+        params = n.remove_user_node_mapping()
+    except Exception as remove_node_err:
+        log.error(remove_node_err)
+    else:
+        log.debug('Removed the user node mapping successfully.')
+        print('Removed node ' + vars['nodeid'] + ' successfully.')
+    return
+
+
+def get_mqtt_host(vars=None):
+    """
+    Shows the MQTT Host endpoint.
+
+    :param vars: Optional parameters including 'profile'
+    :type vars: dict | None
+
+    :raises Exception: If there is an HTTP issue while getting MQTT Host
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        s = get_session_with_profile(vars or {})
+        mqtt_host = s.get_mqtt_host()
+        if mqtt_host is not None:
+            print(mqtt_host)
+    except Exception as e:
+        log.error(e)
+    return
+
+
+def claim_node(vars=None):
+    """
+    Claim the node connected to the given serial port
+    (Get cloud credentials)
+
+    :param vars: `port` as key - Serial Port, defaults to `None`
+    :type vars: str | None
+
+    :raises Exception: If there is an HTTP issue while claiming
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        if not vars['port'] and not vars['mac'] and not vars['addr'] and not vars['platform'] and not vars['outdir']:
+            sys.exit(vars['parser'].print_help())
+        if vars['addr'] and not vars['port'] and not vars['platform']:
+            sys.exit('Invalid. <port> or --platform argument is needed.')
+        if vars['mac']:
+            if not re.match(r'([0-9A-F]:?){12}', vars['mac']):
+                sys.exit('Invalid MAC address.')
+
+        from rmaker_tools.rmaker_claim.claim import claim
+        claim(port=vars['port'], node_platform=vars['platform'], mac_addr=vars['mac'], flash_address=vars['addr'], matter=vars['matter'], out_dir=vars['outdir'], node_type=vars['type'], key_type=vars['key_type'])
+    except Exception as claim_err:
+        log.error(claim_err)
+        return
+
+def ota_upgrade(vars=None):
+    """
+    Upload OTA Firmware image and start OTA Upgrade
+
+    :param vars: `nodeid` as key - Node ID for the node
+                 `otaimagepath` as key - OTA Firmware image path
+                 `profile` as key - Profile to use for the operation
+    :type vars: dict | None
+
+    :raises Exception: If there is an HTTP issue while uploading OTA Firmware image
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        node_id = vars['nodeid']
+        ota_image_path = vars['otaimagepath']
+
+        s = get_session_with_profile(vars or {})
+        n = node.Node(node_id, s)
+        response = n.upload_ota_image(ota_image_path)
+        if response is not None:
+            print(json.dumps(response, indent=4))
+    except Exception as e:
+        log.error(e)
+    return
+
+def raw_api_call(vars=None):
+    """
+    Make raw API calls to RainMaker backend
+
+    :param vars: `method` as key - HTTP method (GET, POST, PUT, DELETE, PATCH)
+                 `api` as key - API endpoint path
+                 `query_params` as key - Query parameters string (optional)
+                 `body` as key - Request body JSON string (optional)
+                 `body_file` as key - Path to file containing request body JSON (optional)
+                 `profile` as key - Profile to use for the operation
+    :type vars: dict | None
+
+    :raises Exception: If there is an HTTP issue while making the API call
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        method = vars.get('method', '').upper()
+        api_path = vars.get('api', '')
+        query_params = vars.get('query_params', None)
+        body_str = vars.get('body', None)
+        body_file = vars.get('body_file', None)
+
+        if not method or not api_path:
+            log.error("Method and API path are required")
+            return
+
+        # Check if both --body and --body-file are provided
+        if body_str and body_file:
+            error_msg = "Cannot specify both --body and --body-file. Use only one."
+            log.error(error_msg)
+            return
+
+        # Read body from file if --body-file is provided
+        if body_file:
+            try:
+                with open(body_file, 'r', encoding='utf-8') as f:
+                    body_str = f.read()
+                log.info(f"Read body from file: {body_file}")
+            except FileNotFoundError:
+                error_msg = f"Body file not found: {body_file}"
+                log.error(error_msg)
+                return
+            except IOError as e:
+                error_msg = f"Error reading body file: {e}"
+                log.error(error_msg)
+                return
+
+        # Get session
+        s = get_session_with_profile(vars or {})
+
+        # Construct URL
+        # get_host() returns something like "https://api.rainmaker.espressif.com/v1/"
+        # If api_path starts with /v1/, remove it since get_host() already includes v1/
+        api_path = api_path.lstrip('/')
+        if api_path.startswith('v1/'):
+            api_path = api_path[3:]  # Remove 'v1/' prefix
+
+        base_url = s.config.get_host()
+
+        # Build full URL
+        full_url = base_url + api_path
+
+        # Add query parameters if provided
+        if query_params:
+            # Ensure query_params doesn't start with ?
+            query_params = query_params.lstrip('?')
+            full_url += '?' + query_params
+
+        print(f"Request URL: {full_url}")
+
+        log.info(f"Making {method} request to: {full_url}")
+        if body_str:
+            log.debug(f"Request body: {body_str}")
+
+        # Parse body if provided
+        body_json = None
+        if body_str:
+            try:
+                body_json = json.loads(body_str)
+            except json.JSONDecodeError as e:
+                body_source = f"--body-file ({body_file})" if body_file else "--body"
+                error_msg = f"Invalid JSON in {body_source}: {e}"
+                log.error(error_msg)
+                return
+
+        # Make the request
+        try:
+            if method == 'GET':
+                response = requests.get(
+                    url=full_url,
+                    headers=s.request_header,
+                    verify=configmanager.CERT_FILE,
+                    timeout=(5.0, 5.0)
+                )
+            elif method == 'POST':
+                response = requests.post(
+                    url=full_url,
+                    headers=s.request_header,
+                    json=body_json,
+                    verify=configmanager.CERT_FILE,
+                    timeout=(5.0, 5.0)
+                )
+            elif method == 'PUT':
+                response = requests.put(
+                    url=full_url,
+                    headers=s.request_header,
+                    json=body_json,
+                    verify=configmanager.CERT_FILE,
+                    timeout=(5.0, 5.0)
+                )
+            elif method == 'DELETE':
+                response = requests.delete(
+                    url=full_url,
+                    headers=s.request_header,
+                    json=body_json,
+                    verify=configmanager.CERT_FILE,
+                    timeout=(5.0, 5.0)
+                )
+            elif method == 'PATCH':
+                response = requests.patch(
+                    url=full_url,
+                    headers=s.request_header,
+                    json=body_json,
+                    verify=configmanager.CERT_FILE,
+                    timeout=(5.0, 5.0)
+                )
+            else:
+                error_msg = f"Unsupported HTTP method: {method}"
+                log.error(error_msg)
+                return
+
+            log.debug(f"Response status: {response.status_code}")
+            log.debug(f"Response headers: {response.headers}")
+            log.debug(f"Response body: {response.text}")
+
+            # Print status code
+            print(f"Status Code: {response.status_code}")
+
+            # Print response
+            try:
+                response_json = response.json()
+                print(json.dumps(response_json, indent=4))
+            except json.JSONDecodeError:
+                # If not JSON, print as text
+                print("Response (text):")
+                print(response.text)
+
+            # Raise for status to handle errors
+            response.raise_for_status()
+
+        except requests.exceptions.HTTPError as http_err:
+            error_msg = f"HTTP error: {http_err}"
+            if hasattr(http_err.response, 'text'):
+                try:
+                    error_json = http_err.response.json()
+                    error_details = json.dumps(error_json, indent=4)
+                    error_msg += f"\nError response: {error_details}"
+                except:
+                    error_msg += f"\nError response: {http_err.response.text}"
+            log.error(error_msg)
+        except requests.exceptions.SSLError:
+            error_msg = "SSL verification failed"
+            log.error(error_msg)
+        except requests.exceptions.ConnectionError:
+            error_msg = "Failed to connect to server"
+            log.error(error_msg)
+        except requests.exceptions.Timeout:
+            error_msg = "Request timed out"
+            log.error(error_msg)
+        except Exception as e:
+            error_msg = f"Request failed: {e}"
+            log.error(error_msg)
+
+    except Exception as e:
+        error_msg = f"Raw API call failed: {e}"
+        log.error(error_msg)
+        import traceback
+        traceback.print_exc()
+    return
+
+
+def node_add_tags(vars=None):
+    """
+    Add tags to a node.
+
+    :param vars: Parameters:
+                 `nodeid` as key - Node ID for the node
+                 `tags` as key - Comma-separated list of tags (key:value format)
+                 `profile` as key - Profile to use for the operation
+    :type vars: dict | None
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        s = get_session_with_profile(vars or {})
+        node_id = vars.get('nodeid')
+        tags_str = vars.get('tags')
+
+        if not node_id:
+            print("Error: Node ID is required.")
+            return
+        if not tags_str:
+            print("Error: Tags are required.")
+            return
+
+        # Parse comma-separated tags
+        tags = [t.strip() for t in tags_str.split(',') if t.strip()]
+
+        # Validate tag format (key:value)
+        for tag in tags:
+            if ':' not in tag:
+                print(f"Error: Invalid tag format '{tag}'. Tags must be in key:value format.")
+                return
+
+        n = node.Node(node_id, s)
+        response = n.update_node_tags(tags)
+
+        if response.get('status') == 'success':
+            print(f"Tags added to node {node_id} successfully.")
+        else:
+            description = response.get('description', 'Unknown error')
+            print(f"Failed to add tags: {description}")
+
+    except Exception as e:
+        log.error(f"Error adding tags: {e}")
+
+
+def node_remove_tags(vars=None):
+    """
+    Remove tags from a node.
+
+    :param vars: Parameters:
+                 `nodeid` as key - Node ID for the node
+                 `tags` as key - Comma-separated list of tags to remove (key:value format)
+                 `profile` as key - Profile to use for the operation
+    :type vars: dict | None
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        s = get_session_with_profile(vars or {})
+        node_id = vars.get('nodeid')
+        tags_str = vars.get('tags')
+
+        if not node_id:
+            print("Error: Node ID is required.")
+            return
+        if not tags_str:
+            print("Error: Tags are required.")
+            return
+
+        # Parse comma-separated tags
+        tags = [t.strip() for t in tags_str.split(',') if t.strip()]
+
+        n = node.Node(node_id, s)
+        response = n.remove_node_tags(tags)
+
+        if response.get('status') == 'success':
+            print(f"Tags removed from node {node_id} successfully.")
+        else:
+            description = response.get('description', 'Unknown error')
+            print(f"Failed to remove tags: {description}")
+
+    except Exception as e:
+        log.error(f"Error removing tags: {e}")
+
+
+def node_set_metadata(vars=None):
+    """
+    Set or update metadata for a node. Follows shadow-style merge rules:
+    - New keys are added, existing keys are updated
+    - To delete a specific key, set its value to null in the JSON
+
+    :param vars: Parameters:
+                 `nodeid` as key - Node ID for the node
+                 `data` as key - JSON string of metadata to set
+                 `filepath` as key - Path to JSON file containing metadata
+                 `profile` as key - Profile to use for the operation
+    :type vars: dict | None
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        s = get_session_with_profile(vars or {})
+        node_id = vars.get('nodeid')
+
+        if not node_id:
+            print("Error: Node ID is required.")
+            return
+
+        # Parse metadata from --data or --filepath
+        data_str = vars.get('data')
+        filepath = vars.get('filepath')
+
+        if not data_str and not filepath:
+            print("Error: Either --data or --filepath is required.")
+            return
+
+        metadata = None
+        if data_str:
+            try:
+                metadata = json.loads(data_str)
+            except json.JSONDecodeError as e:
+                print(f"Error: Invalid JSON in --data: {e}")
+                return
+        elif filepath:
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+            except FileNotFoundError:
+                print(f"Error: File not found: {filepath}")
+                return
+            except json.JSONDecodeError as e:
+                print(f"Error: Invalid JSON in file {filepath}: {e}")
+                return
+
+        n = node.Node(node_id, s)
+        response = n.update_node_metadata(metadata)
+
+        if response.get('status') == 'success':
+            print(f"Metadata updated for node {node_id} successfully.")
+        else:
+            description = response.get('description', 'Unknown error')
+            print(f"Failed to update metadata: {description}")
+
+    except Exception as e:
+        log.error(f"Error updating metadata: {e}")
+
+
+def node_delete_metadata(vars=None):
+    """
+    Delete metadata from a node.
+    Without --key, deletes all metadata.
+    With --key, deletes only the specified key(s).
+
+    :param vars: Parameters:
+                 `nodeid` as key - Node ID for the node
+                 `key` as key - Comma-separated list of metadata keys to delete (optional)
+                 `profile` as key - Profile to use for the operation
+    :type vars: dict | None
+
+    :return: None on Success
+    :rtype: None
+    """
+    try:
+        s = get_session_with_profile(vars or {})
+        node_id = vars.get('nodeid')
+
+        if not node_id:
+            print("Error: Node ID is required.")
+            return
+
+        key_str = vars.get('key')
+
+        n = node.Node(node_id, s)
+
+        if key_str:
+            # Delete specific keys by setting them to None
+            keys = [k.strip() for k in key_str.split(',') if k.strip()]
+            metadata = {k: None for k in keys}
+            response = n.update_node_metadata(metadata)
+            key_list = ', '.join(keys)
+            success_msg = f"Metadata key(s) '{key_list}' deleted from node {node_id} successfully."
+        else:
+            # Delete all metadata by sending null
+            response = n.update_node_metadata(None)
+            success_msg = f"All metadata deleted from node {node_id} successfully."
+
+        if response.get('status') == 'success':
+            print(success_msg)
+        else:
+            description = response.get('description', 'Unknown error')
+            print(f"Failed to delete metadata: {description}")
+
+    except Exception as e:
+        log.error(f"Error deleting metadata: {e}")
+
