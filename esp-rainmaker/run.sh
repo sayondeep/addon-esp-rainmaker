@@ -35,4 +35,5 @@ bashio::log.info "API Port: ${RAINMAKER_API_PORT}"
 bashio::log.info "Base URL: ${ESP_RAINMAKER_BASE_URL}"
 
 # Start the server with proper signal handling
-exec python3 /app/server.py
+# Use unbuffered Python output and redirect stderr to stdout for better logging
+exec python3 -u /app/server.py 2>&1

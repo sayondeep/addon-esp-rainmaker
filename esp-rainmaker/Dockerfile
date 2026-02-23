@@ -17,8 +17,29 @@ RUN apk update && \
     ln -sf python3 /usr/bin/python
 
 # Install Python packages with --break-system-packages for Alpine 3.19+
+# Install websockets for the server
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
-    flask
+    websockets==11.0.3 \
+    esp-rainmaker-cli
+
+# Install esp-rainmaker-cli dependencies
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+    requests>=2.22.0 \
+    cmd2>=0.9.18 \
+    protobuf>=5.29.3 \
+    packaging>=19.2 \
+    oauth2client>=4.1.3 \
+    click>=5.0 \
+    pyserial>=3.0 \
+    future>=0.15.2 \
+    pyparsing>=2.4.0 \
+    pyelftools>=0.22 \
+    esptool>=4.4 \
+    esp-secure-cert-tool==1.0.1 \
+    setuptools \
+    esp_idf_nvs_partition_gen>=0.1.6 \
+    bleak>=0.20.0 \
+    zeroconf>=0.131.0
 
 # Clean up build dependencies to reduce image size
 RUN apk del gcc musl-dev libffi-dev openssl-dev python3-dev rust cargo

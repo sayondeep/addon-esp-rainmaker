@@ -33,10 +33,12 @@ if not rmaker_lib_found:
         pass
 
 if not rmaker_lib_found:
-    raise ImportError(
+    error_msg = (
         "Could not find rmaker_lib. Please ensure esp-rainmaker-cli source code is available "
         "in the same directory as server.py (esp-rainmaker-cli/) or install the package."
     )
+    print(f"FATAL ERROR: {error_msg}", file=sys.stderr, flush=True)
+    sys.exit(1)
 
 # Import ESP RainMaker library
 from rmaker_lib import session, node, user, configmanager
@@ -1083,17 +1085,34 @@ def clear_cache_on_startup():
 
 async def main():
     """Start WebSocket server"""
-    # Clear cache on every restart
-    clear_cache_on_startup()
+    try:
+        # Clear cache on every restart
+        print("Initializing ESP RainMaker server...", flush=True)
+        clear_cache_on_startup()
 
-    port = int(os.environ.get("RAINMAKER_API_PORT", "8099"))
-    host = "0.0.0.0"
+        port = int(os.environ.get("RAINMAKER_API_PORT", "8099"))
+        host = "0.0.0.0"
 
-    print(f"Starting ESP RainMaker WebSocket server on {host}:{port}")
+        print(f"Starting ESP RainMaker WebSocket server on {host}:{port}", flush=True)
 
-    async with websockets.serve(websocket_handler, host, port):
-        print(f"ESP RainMaker WebSocket server running on ws://{host}:{port}")
-        await asyncio.Future()  # run forever
+        async with websockets.serve(websocket_handler, host, port):
+            print(f"ESP RainMaker WebSocket server running on ws://{host}:{port}", flush=True)
+            await asyncio.Future()  # run forever
+    except Exception as e:
+        print(f"FATAL ERROR in main(): {e}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        raise
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        print("ESP RainMaker server starting...", flush=True)
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Server stopped by user", flush=True)
+        sys.exit(0)
+    except Exception as e:
+        print(f"FATAL ERROR: {e}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
