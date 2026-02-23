@@ -1,4 +1,5 @@
-from flask import Flask, jsonify, request
+import asyncio
+import websockets
 import os
 import sys
 import json
@@ -48,8 +49,6 @@ from rmaker_lib.exceptions import (
     AuthenticationError,
     ExpiredSessionError
 )
-
-app = Flask(__name__)
 
 # Global session and config objects
 _global_session = None
@@ -384,88 +383,87 @@ login_success = ensure_login(force_login=(profile_created is not None))
 if not login_success:
     print("WARNING: Failed to login to ESP RainMaker. API endpoints may not work.")
 
-@app.route("/getnodes", methods=["GET"])
-def getnodes():
+# WebSocket message handlers
+async def handle_getnodes():
     """Get list of all node IDs"""
     if not ensure_login():
-        return jsonify({"error": "Authentication failed", "nodes": [], "count": 0})
+        return {"error": "Authentication failed", "nodes": [], "count": 0}
 
     try:
         sess = get_session()
-        nodes_dict = sess.get_nodes()
+        # Run synchronous call in executor to avoid blocking event loop
+        nodes_dict = await asyncio.to_thread(sess.get_nodes)
         nodes = list(nodes_dict.keys())
-        return jsonify({"nodes": nodes, "count": len(nodes)})
+        return {"nodes": nodes, "count": len(nodes)}
     except Exception as e:
         print(f"Error getting nodes: {e}")
-        return jsonify({"error": str(e), "nodes": [], "count": 0})
+        return {"error": str(e), "nodes": [], "count": 0}
 
-@app.route("/nodedetails/<node_id>", methods=["GET"])
-def nodedetails(node_id):
+async def handle_nodedetails(node_id):
     """Get detailed information for a specific node"""
     if not ensure_login():
-        return jsonify({"error": "Authentication failed", "node_id": node_id, "details": None})
+        return {"error": "Authentication failed", "node_id": node_id, "details": None}
 
     try:
         sess = get_session()
-        details = sess.get_node_details_by_id(node_id)
-        return jsonify({"node_id": node_id, "details": details})
+        # Run synchronous call in executor to avoid blocking event loop
+        details = await asyncio.to_thread(sess.get_node_details_by_id, node_id)
+        return {"node_id": node_id, "details": details}
     except Exception as e:
         print(f"Error getting node details for {node_id}: {e}")
-        return jsonify({"error": str(e), "node_id": node_id, "details": None})
+        return {"error": str(e), "node_id": node_id, "details": None}
 
-@app.route("/getparams/<node_id>", methods=["GET"])
-def getparams(node_id):
+async def handle_getparams(node_id):
     """Get device parameters using --auto (local first, fallback to cloud)"""
     if not ensure_login():
-        return jsonify({"error": "Authentication failed", "node_id": node_id, "params": None})
+        return {"error": "Authentication failed", "node_id": node_id, "params": None}
 
     try:
         sess = get_session()
         node_obj = node.Node(node_id, sess)
-        params = get_node_params_with_auto(node_obj, sess)
-        return jsonify({"node_id": node_id, "params": params})
+        # Run synchronous call in executor to avoid blocking event loop
+        params = await asyncio.to_thread(get_node_params_with_auto, node_obj, sess)
+        return {"node_id": node_id, "params": params}
     except Exception as e:
         print(f"Error getting params for {node_id}: {e}")
-        return jsonify({"error": str(e), "node_id": node_id, "params": None})
+        return {"error": str(e), "node_id": node_id, "params": None}
 
-@app.route("/setparams/<node_id>", methods=["POST"])
-def setparams(node_id):
+async def handle_setparams(node_id, data):
     """Set device parameters using --auto (local first, fallback to cloud)"""
     if not ensure_login():
-        return jsonify({"error": "Authentication failed", "node_id": node_id, "success": False})
+        return {"error": "Authentication failed", "node_id": node_id, "success": False}
 
     try:
-        # Get JSON data from request
-        data = request.get_json()
         if not data:
-            return jsonify({"error": "No data provided", "node_id": node_id, "success": False})
+            return {"error": "No data provided", "node_id": node_id, "success": False}
 
         sess = get_session()
         node_obj = node.Node(node_id, sess)
-        result = set_node_params_with_auto(node_obj, data, sess)
+        # Run synchronous call in executor to avoid blocking event loop
+        result = await asyncio.to_thread(set_node_params_with_auto, node_obj, data, sess)
 
-        return jsonify({
+        return {
             "node_id": node_id,
             "success": result is True,
             "data_sent": data
-        })
+        }
     except Exception as e:
         print(f"Error setting params for {node_id}: {e}")
-        return jsonify({
+        return {
             "error": str(e),
             "node_id": node_id,
             "success": False
-        })
+        }
 
-@app.route("/rainmakernodes", methods=["GET"])
-def rainmakernodes():
+async def handle_rainmakernodes():
     """Get RainMaker devices (includes traditional RainMaker and RainMaker Matter, excludes pure Matter)"""
     if not ensure_login():
-        return jsonify({"error": "Authentication failed", "count": 0, "devices": []})
+        return {"error": "Authentication failed", "count": 0, "devices": []}
 
     try:
         sess = get_session()
-        all_node_details = sess.get_node_details()
+        # Run synchronous call in executor to avoid blocking event loop
+        all_node_details = await asyncio.to_thread(sess.get_node_details)
         node_details_list = all_node_details.get("node_details", [])
 
         all_devices = []
@@ -537,23 +535,23 @@ def rainmakernodes():
 
             all_devices.append(device_info)
 
-        return jsonify({
+        return {
             "count": len(all_devices),
             "devices": all_devices
-        })
+        }
     except Exception as e:
         print(f"Error getting RainMaker nodes: {e}")
-        return jsonify({"error": str(e), "count": 0, "devices": []})
+        return {"error": str(e), "count": 0, "devices": []}
 
-@app.route("/allnodes", methods=["GET"])
-def allnodes():
+async def handle_allnodes():
     """Get all nodes with their device type (RainMaker vs Matter)"""
     if not ensure_login():
-        return jsonify({"error": "Authentication failed", "nodes": [], "count": 0, "node_details": []})
+        return {"error": "Authentication failed", "nodes": [], "count": 0, "node_details": []}
 
     try:
         sess = get_session()
-        all_node_details = sess.get_node_details()
+        # Run synchronous call in executor to avoid blocking event loop
+        all_node_details = await asyncio.to_thread(sess.get_node_details)
         node_details_list = all_node_details.get("node_details", [])
 
         all_nodes = []
@@ -584,21 +582,19 @@ def allnodes():
                 "details": node_detail
             })
 
-        return jsonify({
+        return {
             "nodes": [node["node_id"] for node in all_nodes],
             "count": len(all_nodes),
             "node_details": all_nodes
-        })
+        }
     except Exception as e:
         print(f"Error getting all nodes: {e}")
-        return jsonify({"error": str(e), "nodes": [], "count": 0, "node_details": []})
+        return {"error": str(e), "nodes": [], "count": 0, "node_details": []}
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "service": "ESP RainMaker API"})
+async def handle_health():
+    return {"status": "ok", "service": "ESP RainMaker API"}
 
-@app.route("/login-status", methods=["GET"])
-def login_status():
+async def handle_login_status():
     """Check ESP RainMaker login status"""
     is_logged_in = ensure_login()
     profile = os.environ.get("ESP_RAINMAKER_PROFILE")
@@ -616,14 +612,104 @@ def login_status():
         if not profile or profile.lower() == "null" or profile.strip() == "":
             profile = "my_profile"
 
-    return jsonify({
+    return {
         "logged_in": is_logged_in,
         "email": os.environ.get("ESP_RAINMAKER_EMAIL", "Not set"),
         "profile": profile,
         "base_url": base_url if base_url else "Not set",
         "service": "ESP RainMaker API"
-    })
+    }
+
+async def handle_message(websocket, message):
+    """Handle incoming WebSocket message"""
+    try:
+        data = json.loads(message)
+        msg_type = data.get("type")
+        msg_id = data.get("id")
+        payload = data.get("payload", {})
+
+        response = None
+
+        # Route message to appropriate handler
+        if msg_type == "getnodes":
+            response = await handle_getnodes()
+        elif msg_type == "nodedetails":
+            node_id = payload.get("node_id")
+            if not node_id:
+                response = {"error": "node_id required"}
+            else:
+                response = await handle_nodedetails(node_id)
+        elif msg_type == "getparams":
+            node_id = payload.get("node_id")
+            if not node_id:
+                response = {"error": "node_id required"}
+            else:
+                response = await handle_getparams(node_id)
+        elif msg_type == "setparams":
+            node_id = payload.get("node_id")
+            data = payload.get("data")
+            if not node_id:
+                response = {"error": "node_id required"}
+            elif data is None:
+                response = {"error": "data required"}
+            else:
+                response = await handle_setparams(node_id, data)
+        elif msg_type == "rainmakernodes":
+            response = await handle_rainmakernodes()
+        elif msg_type == "allnodes":
+            response = await handle_allnodes()
+        elif msg_type == "health":
+            response = await handle_health()
+        elif msg_type == "login_status":
+            response = await handle_login_status()
+        else:
+            response = {"error": f"Unknown message type: {msg_type}"}
+
+        # Send response
+        response_message = {
+            "id": msg_id,
+            "type": msg_type,
+            "payload": response
+        }
+        await websocket.send(json.dumps(response_message))
+
+    except json.JSONDecodeError as e:
+        error_response = {
+            "id": None,
+            "type": "error",
+            "payload": {"error": f"Invalid JSON: {str(e)}"}
+        }
+        await websocket.send(json.dumps(error_response))
+    except Exception as e:
+        print(f"Error handling message: {e}")
+        error_response = {
+            "id": data.get("id") if 'data' in locals() else None,
+            "type": data.get("type", "error") if 'data' in locals() else "error",
+            "payload": {"error": str(e)}
+        }
+        await websocket.send(json.dumps(error_response))
+
+async def websocket_handler(websocket, path):
+    """Main WebSocket connection handler"""
+    print(f"WebSocket client connected: {websocket.remote_address}")
+    try:
+        async for message in websocket:
+            await handle_message(websocket, message)
+    except websockets.exceptions.ConnectionClosed:
+        print(f"WebSocket client disconnected: {websocket.remote_address}")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+
+async def main():
+    """Start WebSocket server"""
+    port = int(os.environ.get("RAINMAKER_API_PORT", "8099"))
+    host = "0.0.0.0"
+
+    print(f"Starting ESP RainMaker WebSocket server on {host}:{port}")
+
+    async with websockets.serve(websocket_handler, host, port):
+        print(f"ESP RainMaker WebSocket server running on ws://{host}:{port}")
+        await asyncio.Future()  # run forever
 
 if __name__ == "__main__":
-    port = int(os.environ.get("RAINMAKER_API_PORT", "8099"))
-    app.run(host="0.0.0.0", port=port)
+    asyncio.run(main())
